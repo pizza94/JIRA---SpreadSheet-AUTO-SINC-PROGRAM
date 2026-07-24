@@ -1,0 +1,48 @@
+{
+  "name": "jira-spreadsheet-automation",
+  "version": "1.1.9",
+  "private": true,
+  "description": "사내 Jira 이슈를 Google Sheets 릴리스 체크리스트에 동기화하는 Windows 데스크톱 앱",
+  "main": "electron/main.mjs",
+  "type": "module",
+  "scripts": {
+    "app": "electron .",
+    "dist:win": "electron-builder --win portable",
+    "jira:login": "node scripts/jira-login.mjs",
+    "sync": "node scripts/sync-jira-to-sheets.mjs"
+  },
+  "dependencies": {
+    "playwright": "^1.61.0"
+  },
+  "devDependencies": {
+    "electron": "^43.2.0",
+    "electron-builder": "^26.15.3"
+  },
+  "build": {
+    "appId": "com.datastreams.jirasheetssync",
+    "productName": "Jira Sheets Sync",
+    "asar": true,
+    "asarUnpack": [
+      "scripts/**",
+      "node_modules/playwright/**",
+      "node_modules/playwright-core/**"
+    ],
+    "files": [
+      "electron/**",
+      "scripts/jira-login.mjs",
+      "scripts/sync-jira-to-sheets.mjs",
+      "package.json",
+      "node_modules/playwright/**",
+      "node_modules/playwright-core/**"
+    ],
+    "directories": {
+      "output": "dist"
+    },
+    "win": {
+      "target": [
+        "portable"
+      ],
+      "artifactName": "Jira-Sheets-Sync-${version}.${ext}"
+    }
+  }
+}
