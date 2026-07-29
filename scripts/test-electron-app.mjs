@@ -257,9 +257,9 @@ try {
   const resultFiles = await readdir(testResultPath);
   if (
     resultFiles.length !== 1 ||
-    resultFiles[0] !== "Jira-Sheets-작업결과.txt"
+    !/^Jira-Sheets-작업결과-\d{4}-\d{2}-\d{2}\.txt$/.test(resultFiles[0])
   ) {
-    throw new Error(`결과 파일 단일화 검증 실패: ${resultFiles.join(", ")}`);
+    throw new Error(`날짜별 결과 파일 검증 실패: ${resultFiles.join(", ")}`);
   }
   const visibleFailureLog = {
     open: await window.locator("#logSection").evaluate((element) => element.open),

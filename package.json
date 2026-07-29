@@ -12,6 +12,7 @@
     "test:sync-mode": "node scripts/test-sync-mode.mjs",
     "test:summary": "node scripts/test-sync-summary.mjs",
     "test:sheet-url": "node scripts/test-google-sheet-url.mjs",
+    "test:result-history": "node scripts/test-result-history.mjs",
     "jira:login": "node scripts/jira-login.mjs",
     "jira:scrape": "node scripts/jira-scrape.mjs",
     "sync": "node scripts/sync-jira-to-sheets.mjs"
@@ -38,6 +39,7 @@
       "scripts/google-sheet-url.mjs",
       "scripts/sync-mode.mjs",
       "scripts/snapshot-rules.mjs",
+      "scripts/result-history.mjs",
       "scripts/sync-summary.mjs",
       "scripts/sync-jira-to-sheets.mjs",
       "package.json",

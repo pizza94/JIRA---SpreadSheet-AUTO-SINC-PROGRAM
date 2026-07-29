@@ -31,7 +31,7 @@ const summary = buildSyncSummary({
       status: "개발완료"
     }
   ],
-  resultPath: "C:\\Result\\Jira-Sheets-작업결과.txt"
+  resultPath: "C:\\Result\\Jira-Sheets-작업결과-2026-07-28.txt"
 });
 
 assert.match(summary, /결과: 성공/);
@@ -40,6 +40,6 @@ assert.match(summary, /MS-12756: 업데이트, 25행/);
 assert.match(summary, /MS-12847: 추가, 26행/);
 assert.match(summary, /배포 2026\.07\.30/);
 assert.match(summary, /12\.3초/);
-assert.match(summary, /Jira-Sheets-작업결과\.txt/);
+assert.match(summary, /Jira-Sheets-작업결과-2026-07-28\.txt/);
 
 console.log("sync summary tests passed");

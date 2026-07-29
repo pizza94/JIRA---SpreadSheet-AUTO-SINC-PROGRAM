@@ -11,6 +11,7 @@ import {
   shell
 } from "electron";
 import { parseGoogleSheetLink } from "../scripts/google-sheet-url.mjs";
+import { prependDailyResult } from "../scripts/result-history.mjs";
 import {
   normalizeSnapshotName,
   normalizeWorkMode
@@ -312,7 +313,6 @@ async function writeFailureResult(
 ) {
   const targetDirectory = validateOutputDirectory(outputDirectory);
   await mkdir(targetDirectory, { recursive: true });
-  const target = path.join(targetDirectory, "Jira-Sheets-작업결과.txt");
   const reason = summarizeError(errorOutput || output);
   const issueKeys = [
     ...new Set(
@@ -345,8 +345,7 @@ async function writeFailureResult(
     ...(progressLines.length ? [...new Set(progressLines)] : ["- 기록 없음"]),
     ""
   ].join("\r\n");
-  await writeFile(target, content, "utf8");
-  return target;
+  return prependDailyResult(targetDirectory, content, new Date());
 }
 
 function formatKoreanDateTime(value) {

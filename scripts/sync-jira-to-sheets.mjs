@@ -1,7 +1,11 @@
-import { access, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { chromium } from "playwright";
 import { parseGoogleSheetLink } from "./google-sheet-url.mjs";
+import {
+  dailyResultFileName,
+  prependDailyResult
+} from "./result-history.mjs";
 import { buildSyncSummary } from "./sync-summary.mjs";
 import {
   assertSheetMutationTarget,
@@ -79,7 +83,10 @@ try {
   const issues = await fetchJiraIssues(browser, args.issueKeys);
   const sheetResult = await syncIssuesToSheet(browser, issues, args);
   const completedAt = new Date();
-  const resultPath = resolve(outputDir, "Jira-Sheets-작업결과.txt");
+  const resultPath = resolve(
+    outputDir,
+    dailyResultFileName(completedAt)
+  );
   const report = {
     status: "성공",
     completedAt: completedAt.toISOString(),
@@ -93,13 +100,13 @@ try {
   };
 
   await mkdir(outputDir, { recursive: true });
-  await writeFile(
-    resultPath,
+  await prependDailyResult(
+    outputDir,
     buildSyncSummary({
       ...report,
       resultPath
     }),
-    "utf8"
+    completedAt
   );
 
   console.log(
