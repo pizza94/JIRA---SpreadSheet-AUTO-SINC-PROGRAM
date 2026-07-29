@@ -464,10 +464,16 @@ function summarizeError(text) {
     (line) =>
       !/^Node\.js v\d+/i.test(line) &&
       !/^at\s+/i.test(line) &&
+      !/^file:\/\//i.test(line) &&
+      !/^throw new Error/i.test(line) &&
+      !/^\^+$/.test(line) &&
       !/^[{}\[\],]+$/.test(line) &&
       !/^(name|stack|message):/i.test(line)
   );
-  const errorLine = meaningfulLines.find((line) =>
+  const explicitErrorLine = meaningfulLines.find((line) =>
+    /^Error:\s*/i.test(line)
+  );
+  const errorLine = explicitErrorLine ?? meaningfulLines.find((line) =>
     /(error:|net::err|econn|timeout|timed out|실패|오류|권한|만료)/i.test(line)
   );
   return (errorLine ?? meaningfulLines.at(-1) ?? "작업에 실패했습니다.").replace(

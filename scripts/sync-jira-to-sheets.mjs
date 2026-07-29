@@ -6,6 +6,11 @@ import {
   dailyResultFileName,
   prependDailyResult
 } from "./result-history.mjs";
+import {
+  formatIssueRowMismatches,
+  issueRowMismatches,
+  normalizeVerificationValue
+} from "./sheet-verification.mjs";
 import { buildSyncSummary } from "./sync-summary.mjs";
 import {
   assertSheetMutationTarget,
@@ -593,7 +598,7 @@ async function syncIssuesToSheet(browserInstance, issues, config) {
         issue.issueType,
         `=HYPERLINK("${issue.url}","${issue.key}")`,
         customer,
-        issue.title,
+        normalizeVerificationValue(issue.title),
         issue.status,
         issue.priority,
         issue.assignee
@@ -2317,28 +2322,46 @@ async function waitForIssueRow(
   referenceExpectation = null
 ) {
   const deadline = Date.now() + 30_000;
+  let lastMismatches = [];
   while (Date.now() < deadline) {
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 500));
     const rows = await readSheetRows(request, exportUrl);
     const row = rows[rowNumber - 1] ?? [];
-    if (
-      jiraKeyFromCell(row[2]) === issue.key &&
-      row[4] === issue.title &&
-      row[5] === issue.status &&
-      row[6] === issue.priority &&
-      row[7] === issue.assignee &&
-      (!snapshotExpectation ||
-        String(row[snapshotExpectation.columnIndex] ?? "") ===
-          snapshotExpectation.value) &&
-      (!referenceExpectation ||
-        String(row[referenceExpectation.columnIndex] ?? "")
-          .trim()
-          .toUpperCase() === referenceExpectation.value)
-    ) {
+    const actual = {
+      key: jiraKeyFromCell(row[2]),
+      title: row[4],
+      status: row[5],
+      priority: row[6],
+      assignee: row[7],
+      ...(snapshotExpectation
+        ? { snapshot: row[snapshotExpectation.columnIndex] }
+        : {}),
+      ...(referenceExpectation
+        ? { reference: row[referenceExpectation.columnIndex] }
+        : {})
+    };
+    const expected = {
+      key: issue.key,
+      title: issue.title,
+      status: issue.status,
+      priority: issue.priority,
+      assignee: issue.assignee,
+      ...(snapshotExpectation
+        ? { snapshot: snapshotExpectation.value }
+        : {}),
+      ...(referenceExpectation
+        ? { reference: referenceExpectation.value }
+        : {})
+    };
+    lastMismatches = issueRowMismatches(actual, expected);
+    if (lastMismatches.length === 0) {
       return { row, rows };
     }
   }
-  throw new Error(`${issue.key}의 Google Sheets 저장 검증에 실패했습니다.`);
+  throw new Error(
+    `${issue.key}의 Google Sheets 저장 검증에 실패했습니다: ` +
+      formatIssueRowMismatches(lastMismatches)
+  );
 }
 
 function jiraKeyFromCell(value) {
