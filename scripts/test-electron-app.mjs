@@ -1,4 +1,11 @@
-import { access, mkdir, rm, writeFile } from "node:fs/promises";
+import {
+  access,
+  mkdir,
+  readFile,
+  readdir,
+  rm,
+  writeFile
+} from "node:fs/promises";
 import { resolve } from "node:path";
 import { _electron as electron } from "playwright";
 
@@ -10,6 +17,7 @@ const screenshotPath = resolve(
 );
 await mkdir(resolve("output"), { recursive: true });
 const testDataPath = resolve("output/electron-test-data");
+const testResultPath = resolve(testDataPath, "results");
 const testAuthPath = resolve(testDataPath, "playwright/.auth");
 await rm(testDataPath, { recursive: true, force: true });
 await mkdir(testAuthPath, { recursive: true });
@@ -20,12 +28,22 @@ const electronApp = await electron.launch(
   packagedExecutable
     ? {
         executablePath: packagedExecutable,
-        env: { ...process.env, AUTOMATION_DATA_DIR: testDataPath }
+        env: {
+          ...process.env,
+          AUTOMATION_DATA_DIR: testDataPath,
+          AUTOMATION_DEFAULT_OUTPUT_DIR: testResultPath,
+          JIRA_BASE_URL: "http://127.0.0.1:1"
+        }
       }
     : {
         args: ["."],
         cwd: process.cwd(),
-        env: { ...process.env, AUTOMATION_DATA_DIR: testDataPath }
+        env: {
+          ...process.env,
+          AUTOMATION_DATA_DIR: testDataPath,
+          AUTOMATION_DEFAULT_OUTPUT_DIR: testResultPath,
+          JIRA_BASE_URL: "http://127.0.0.1:1"
+        }
       }
 );
 
@@ -33,33 +51,64 @@ let appClosed = false;
 try {
   const window = await electronApp.firstWindow();
   await window.waitForLoadState("domcontentloaded");
-  await window.locator("#jiraBaseUrl").waitFor({ state: "visible" });
+  await window.locator("#issueKeys").waitFor({ state: "visible" });
 
   const checks = {
     title: await window.title(),
     heading: await window.locator("h1").innerText(),
-    jiraBaseUrl: await window.locator("#jiraBaseUrl").inputValue(),
-    jiraPlaceholder: await window.locator("#jiraBaseUrl").getAttribute("placeholder"),
+    jiraAddressInputs: await window.locator("#jiraBaseUrl").count(),
+    sheetNameInputs: await window.locator("#sheetName").count(),
+    issueKeysPlaceholder: await window.locator("#issueKeys").getAttribute("placeholder"),
+    workModeOptions: await window.locator('input[name="workMode"]').count(),
+    snapshotPlaceholder: await window
+      .locator("#snapshotName")
+      .getAttribute("placeholder"),
     sheetPlaceholder: await window.locator("#sheetUrl").getAttribute("placeholder"),
+    outputDirectory: await window.locator("#outputDirectory").inputValue(),
+    chooseOutputButton: await window.locator("#chooseOutputButton").innerText(),
     deadlinePlaceholder: await window.locator("#deadline").getAttribute("placeholder"),
     copyButtons: await window.locator(".copy-default").count(),
     sheetWarning: await window.locator(".field-warning").innerText(),
     preloadApi: await window.evaluate(
-      () => typeof window.jiraSheetsApp?.startSync === "function"
+      () =>
+        typeof window.jiraSheetsApp?.startSync === "function" &&
+        typeof window.jiraSheetsApp?.chooseOutputDirectory === "function" &&
+        typeof window.jiraSheetsApp?.openOutput === "function"
     ),
-    syncButton: await window.locator("#syncButton").innerText(),
-    loginButton: await window.locator("#loginButton").innerText()
+    syncButton: (await window.locator("#syncButton").textContent())?.trim(),
+    cancelButton: (await window.locator("#cancelButton").textContent())?.trim(),
+    activityControls: await window
+      .locator(".activity-panel .activity-actions")
+      .count(),
+    loginButton: await window.locator("#loginButton").innerText(),
+    loginRequiredMarks: await window
+      .locator(".login-required .required-mark")
+      .count(),
+    sheetRequiredMarks: await window
+      .locator('label:has(#sheetUrl) .required-mark')
+      .count()
   };
 
   if (
     checks.title !== "Jira Sheets Sync" ||
     checks.heading !== "Jira Sheets Sync" ||
     !checks.preloadApi ||
-    !checks.jiraPlaceholder?.startsWith("예:") ||
-    !checks.sheetPlaceholder?.startsWith("예:") ||
+    checks.jiraAddressInputs !== 0 ||
+    checks.sheetNameInputs !== 0 ||
+    checks.workModeOptions !== 2 ||
+    checks.snapshotPlaceholder !== "예: SNAPSHOT-3" ||
+    !checks.issueKeysPlaceholder?.includes("[MS-12469] - MyPage") ||
+    !checks.sheetPlaceholder?.includes("gid=123") ||
+    checks.outputDirectory !== testResultPath ||
+    checks.chooseOutputButton !== "폴더 선택" ||
     checks.deadlinePlaceholder !== "예: 2026.07.23" ||
-    checks.copyButtons !== 2 ||
-    !checks.sheetWarning.includes("버전에 맞는 Google Sheets 주소")
+    checks.copyButtons !== 1 ||
+    checks.syncButton !== "작업 시작" ||
+    checks.cancelButton !== "작업 중지" ||
+    checks.activityControls !== 1 ||
+    checks.loginRequiredMarks !== 1 ||
+    checks.sheetRequiredMarks !== 1 ||
+    !checks.sheetWarning.includes("링크의 gid로 탭을 자동 선택")
   ) {
     throw new Error(`Electron UI 검증 실패: ${JSON.stringify(checks)}`);
   }
@@ -67,14 +116,14 @@ try {
   const validationMessage = await window.evaluate(async () => {
     try {
       await window.jiraSheetsApp.startSync({
-        jiraBaseUrl: "http://jira.example.local:8079",
         issueKeys:
-          '버그\n[MS-12818] - [KB증권] 용어 신규 팝업 항목 누락\n' +
+          '버그\n[MS-12818] - [고객사] 용어 신규 팝업 항목 누락\n' +
           '개선\n[MS-12807] - 결재현황 개선\n[MS-12811] - 변경분 하이라이트\n' +
           '부작업\n[MS-12469] - MyPage 버튼 추가\n[MS-12470] - 재신청 버튼 추가\n' +
           '[MS-12473] - "변경요약" 팝업 추가',
         sheetUrl: "",
-        sheetName: "4.2.2.59 (LS증권)",
+        workMode: "existing",
+        snapshotName: "SNAPSHOT-3",
         deadline: "",
         testStartDate: "",
         testEndDate: ""
@@ -88,14 +137,71 @@ try {
     throw new Error(`URL 오류 안내 검증 실패: ${validationMessage}`);
   }
 
-  const dateValidationMessage = await window.evaluate(async () => {
+  const missingWorkModeMessage = await window.evaluate(async () => {
     try {
       await window.jiraSheetsApp.startSync({
-        jiraBaseUrl: "http://jira.example.local:8079",
+        issueKeys: "MS-4395",
+        workMode: "",
+        snapshotName: "SNAPSHOT-3",
+        sheetUrl:
+          "https://docs.google.com/spreadsheets/d/YOUR_SPREADSHEET_ID/edit?gid=94813446#gid=94813446"
+      });
+      return "";
+    } catch (error) {
+      return error.message;
+    }
+  });
+  if (!missingWorkModeMessage.includes("작업 유형")) {
+    throw new Error(`작업 유형 필수 검증 실패: ${missingWorkModeMessage}`);
+  }
+
+  const missingSnapshotMessage = await window.evaluate(async () => {
+    try {
+      await window.jiraSheetsApp.startSync({
+        issueKeys: "MS-4395",
+        workMode: "new",
+        snapshotName: "",
+        sheetUrl:
+          "https://docs.google.com/spreadsheets/d/YOUR_SPREADSHEET_ID/edit?gid=94813446#gid=94813446"
+      });
+      return "";
+    } catch (error) {
+      return error.message;
+    }
+  });
+  if (!missingSnapshotMessage.includes("SNAPSHOT-숫자")) {
+    throw new Error(`SNAPSHOT 필수 검증 실패: ${missingSnapshotMessage}`);
+  }
+
+  const missingGidMessage = await window.evaluate(async () => {
+    try {
+      await window.jiraSheetsApp.startSync({
         issueKeys: "MS-4395",
         sheetUrl:
           "https://docs.google.com/spreadsheets/d/YOUR_SPREADSHEET_ID/edit",
-        sheetName: "4.2.2.59 (LS증권)",
+        workMode: "existing",
+        snapshotName: "SNAPSHOT-3",
+        deadline: "",
+        testStartDate: "",
+        testEndDate: ""
+      });
+      return "";
+    } catch (error) {
+      return error.message;
+    }
+  });
+  if (!missingGidMessage.includes("gid가 없습니다")) {
+    throw new Error(`gid 오류 안내 검증 실패: ${missingGidMessage}`);
+  }
+
+  const dateValidationMessage = await window.evaluate(async () => {
+    try {
+      await window.jiraSheetsApp.startSync({
+        issueKeys: "MS-4395",
+        sheetUrl:
+          "https://docs.google.com/spreadsheets/d/YOUR_SPREADSHEET_ID/edit?gid=94813446#gid=94813446",
+        workMode: "existing",
+        snapshotName: "SNAPSHOT-3",
         deadline: "2026.02.30",
         testStartDate: "",
         testEndDate: ""
@@ -124,7 +230,7 @@ try {
           }
         });
         window.jiraSheetsApp
-          .loginJira({ jiraBaseUrl: "http://127.0.0.1:1" })
+          .loginJira()
           .catch((error) => {
             clearTimeout(timeout);
             unsubscribe();
@@ -134,12 +240,27 @@ try {
   );
   if (
     failureEvent.ok ||
-    !failureEvent.logPath ||
+    !failureEvent.resultPath ||
+    !resolve(failureEvent.resultPath).startsWith(testResultPath) ||
     /^Node\.js v/i.test(failureEvent.message)
   ) {
     throw new Error(`실패 로그 이벤트 검증 실패: ${JSON.stringify(failureEvent)}`);
   }
-  await access(failureEvent.logPath);
+  await access(failureEvent.resultPath);
+  const failureResultText = await readFile(failureEvent.resultPath, "utf8");
+  if (
+    !failureResultText.includes("결과: 실패") ||
+    failureResultText.includes("Call log:")
+  ) {
+    throw new Error(`실패 결과 요약 검증 실패: ${failureResultText}`);
+  }
+  const resultFiles = await readdir(testResultPath);
+  if (
+    resultFiles.length !== 1 ||
+    resultFiles[0] !== "Jira-Sheets-작업결과.txt"
+  ) {
+    throw new Error(`결과 파일 단일화 검증 실패: ${resultFiles.join(", ")}`);
+  }
   const visibleFailureLog = {
     open: await window.locator("#logSection").evaluate((element) => element.open),
     text: await window.locator("#logOutput").innerText()
@@ -147,40 +268,40 @@ try {
   if (
     !visibleFailureLog.open ||
     !visibleFailureLog.text.includes("[실패 원인]") ||
-    !visibleFailureLog.text.includes("[실패 로그 파일]")
+    !visibleFailureLog.text.includes("[실패 결과 파일]")
   ) {
     throw new Error(
       `실패 로그 화면 검증 실패: ${JSON.stringify(visibleFailureLog)}`
     );
   }
 
-  await window.locator('.copy-default[data-target="jiraBaseUrl"]').click();
   await window.locator('.copy-default[data-target="sheetUrl"]').click();
   const defaultInputValues = {
-    jiraBaseUrl: await window.locator("#jiraBaseUrl").inputValue(),
     sheetUrl: await window.locator("#sheetUrl").inputValue()
   };
   if (
-    defaultInputValues.jiraBaseUrl !== "http://jira.example.local:8079/" ||
     defaultInputValues.sheetUrl !==
-      "https://docs.google.com/spreadsheets/d/YOUR_SPREADSHEET_ID/edit"
+      "https://docs.google.com/spreadsheets/d/YOUR_SPREADSHEET_ID/edit?gid=94813446#gid=94813446"
   ) {
     throw new Error(
       `기본값 자동 입력 검증 실패: ${JSON.stringify(defaultInputValues)}`
     );
   }
 
-  await window.evaluate(() =>
-    window.jiraSheetsApp.saveSettings({
-      jiraBaseUrl: "http://jira.example.local:8079",
-      issueKeys: "MS-4395",
-      sheetUrl:
-        "https://docs.google.com/spreadsheets/d/YOUR_SPREADSHEET_ID/edit",
-      sheetName: "4.2.2.59(LS증권)",
-      deadline: "2026.07.23",
-      testStartDate: "2026.07.23",
-      testEndDate: "2026.07.23"
-    })
+  await window.evaluate(
+    (outputDirectory) =>
+      window.jiraSheetsApp.saveSettings({
+        issueKeys: "MS-4395",
+        workMode: "new",
+        snapshotName: "SNAPSHOT-3",
+        sheetUrl:
+          "https://docs.google.com/spreadsheets/d/YOUR_SPREADSHEET_ID/edit?gid=94813446#gid=94813446",
+        deadline: "2026.07.23",
+        testStartDate: "2026.07.23",
+        testEndDate: "2026.07.23",
+        outputDirectory
+      }),
+    testResultPath
   );
   await window.screenshot({ path: screenshotPath, fullPage: true });
   console.log(
@@ -189,6 +310,7 @@ try {
         packagedExecutable,
         checks,
         validationMessage,
+        missingGidMessage,
         screenshotPath
       },
       null,

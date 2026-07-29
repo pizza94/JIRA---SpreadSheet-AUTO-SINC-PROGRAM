@@ -1,21 +1,67 @@
 import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { chromium } from "playwright";
+import { parseGoogleSheetLink } from "./google-sheet-url.mjs";
+import { buildSyncSummary } from "./sync-summary.mjs";
+import {
+  assertSheetMutationTarget,
+  countIssueRows,
+  findDashboardDropdownSampleCell,
+  findPreviousSnapshotIndex,
+  normalizeIssueTypeForStyle,
+  normalizeSnapshotName,
+  normalizeWorkMode,
+  planNewChecklistSnapshotColumns,
+  planRequestedSnapshotColumn,
+  shouldUseTemplateForInsertedRow,
+  validateTemplateCopyConfig,
+  WORK_MODE_NEW
+} from "./sync-mode.mjs";
+import {
+  carriedSnapshotValue,
+  copiedSnapshotRepairValue,
+  findBlankSnapshotWorkIndex,
+  findHistoricalInactiveStyleSource,
+  isKnownSnapshotDropdownValue,
+  isSnapshotWorkHeader,
+  referenceValueForRun,
+  snapshotCarryAction,
+  snapshotValueForRun,
+  shouldResetCarriedSnapshot
+} from "./snapshot-rules.mjs";
 
-const jiraBaseUrl =
-  process.env.JIRA_BASE_URL ?? "http://jira.example.local:8079";
+const jiraBaseUrl = process.env.JIRA_BASE_URL ?? "http://jira.example.local:8079";
 const dataRoot = resolve(process.env.AUTOMATION_DATA_DIR ?? ".");
-const outputDir = resolve(dataRoot, "output");
+const outputDir = resolve(
+  process.env.AUTOMATION_OUTPUT_DIR ?? resolve(dataRoot, "output")
+);
 const jiraAuthFile = resolve(dataRoot, "playwright/.auth/jira.json");
 const googleAuthFile = resolve(dataRoot, "playwright/.auth/google.json");
 const args = parseArgs(process.argv.slice(2));
+const sheetMutationTargets = new WeakMap();
+const jiraFetchConcurrency = 4;
+const defaultTemplateSheetName = "스프레드시트양식";
+const newModeProtectedTemplateSheetNames = new Set([
+  defaultTemplateSheetName
+]);
+const processStartedAt = Date.now();
+let sheetReadCount = 0;
+let sheetReadDurationMs = 0;
 
-if (!args.issueKeys.length || !args.sheetUrl || !args.sheetName) {
+if (
+  !args.issueKeys.length ||
+  !args.sheetUrl ||
+  !args.workMode ||
+  !args.snapshotName
+) {
   throw new Error(
     "사용법: npm run sync -- --issues MS-100,MS-101 " +
-      '--sheet-url "Google Sheets URL" --sheet-name "시트 탭 이름"'
+      '--sheet-url "Google Sheets URL (gid 포함)" ' +
+      '--work-mode new|existing --snapshot-name SNAPSHOT-3'
   );
 }
+args.workMode = normalizeWorkMode(args.workMode);
+args.snapshotName = normalizeSnapshotName(args.snapshotName);
 
 await requireFile(
   jiraAuthFile,
@@ -32,40 +78,42 @@ const browser = await chromium.launch({
 try {
   const issues = await fetchJiraIssues(browser, args.issueKeys);
   const sheetResult = await syncIssuesToSheet(browser, issues, args);
-  const reportPath = resolve(
-    outputDir,
-    `sync-${new Date().toISOString().replace(/[:.]/g, "-")}.json`
-  );
+  const completedAt = new Date();
+  const resultPath = resolve(outputDir, "Jira-Sheets-작업결과.txt");
+  const report = {
+    status: "성공",
+    completedAt: completedAt.toISOString(),
+    jiraBaseUrl,
+    sheetName: sheetResult.sheetName,
+    sheetUrl: sheetResult.resolvedSheetUrl,
+    snapshot: sheetResult.snapshot,
+    schedule: sheetResult.schedule,
+    performance: sheetResult.performance,
+    results: sheetResult.results
+  };
 
   await mkdir(outputDir, { recursive: true });
   await writeFile(
-    reportPath,
-    `${JSON.stringify(
-      {
-        jiraBaseUrl,
-        sheetName: args.sheetName,
-        sheetUrl: sheetResult.resolvedSheetUrl,
-        schedule: sheetResult.schedule,
-        results: sheetResult.results
-      },
-      null,
-      2
-    )}\n`,
+    resultPath,
+    buildSyncSummary({
+      ...report,
+      resultPath
+    }),
     "utf8"
   );
 
   console.log(
     JSON.stringify(
       {
-        sheetName: args.sheetName,
+        sheetName: sheetResult.sheetName,
         resolvedSheetUrl: sheetResult.resolvedSheetUrl,
+        snapshot: sheetResult.snapshot,
         schedule: sheetResult.schedule,
+        performance: sheetResult.performance,
         results: sheetResult.results,
-        screenshotPath: sheetResult.screenshotPath,
-        reportPath
-      },
-      null,
-      2
+        resultPath,
+        outputDirectory: outputDir
+      }
     )
   );
 } finally {
@@ -76,7 +124,8 @@ function parseArgs(argv) {
   const parsed = {
     issueKeys: [],
     sheetUrl: "",
-    sheetName: "",
+    workMode: "",
+    snapshotName: "",
     deadline: "",
     testStartDate: "",
     testEndDate: ""
@@ -91,8 +140,10 @@ function parseArgs(argv) {
         .filter(Boolean);
     } else if (argument === "--sheet-url") {
       parsed.sheetUrl = argv[++index] ?? "";
-    } else if (argument === "--sheet-name") {
-      parsed.sheetName = argv[++index] ?? "";
+    } else if (argument === "--work-mode") {
+      parsed.workMode = argv[++index] ?? "";
+    } else if (argument === "--snapshot-name") {
+      parsed.snapshotName = argv[++index] ?? "";
     } else if (argument === "--deadline") {
       parsed.deadline = argv[++index] ?? "";
     } else if (argument === "--test-start-date") {
@@ -155,39 +206,63 @@ async function fetchJiraIssues(browserInstance, issueKeys) {
   const issues = [];
 
   try {
-    for (const issueKey of issueKeys) {
-      const apiUrl =
-        `${jiraBaseUrl}/rest/api/2/issue/${encodeURIComponent(issueKey)}` +
-        `?fields=${encodeURIComponent(fields)}`;
-      const response = await context.request.get(apiUrl, {
-        headers: { Accept: "application/json" },
-        timeout: 20_000
-      });
+    const startedAt = Date.now();
+    const results = Array(issueKeys.length);
+    let nextIndex = 0;
+    let fatalError = null;
 
-      if (response.status() === 401) {
-        throw new Error(
-          "Jira 로그인 세션이 만료됐습니다. npm run jira:login 후 다시 실행하세요."
-        );
-      }
-      if (response.status() === 403) {
-        throw new Error(`${issueKey} 조회 권한이 없습니다.`);
-      }
-      if (!response.ok()) {
-        throw new Error(
-          `${issueKey} Jira 조회 실패: HTTP ${response.status()} ${await response.text()}`
-        );
-      }
+    async function worker() {
+      while (!fatalError) {
+        const index = nextIndex;
+        nextIndex += 1;
+        if (index >= issueKeys.length) {
+          return;
+        }
+        const issueKey = issueKeys[index];
+        try {
+          const apiUrl =
+            `${jiraBaseUrl}/rest/api/2/issue/${encodeURIComponent(issueKey)}` +
+            `?fields=${encodeURIComponent(fields)}`;
+          const response = await context.request.get(apiUrl, {
+            headers: { Accept: "application/json" },
+            timeout: 20_000
+          });
 
-      const source = await response.json();
-      const issue = normalizeJiraIssue(source);
-      issues.push(issue);
-      await mkdir(outputDir, { recursive: true });
-      await writeFile(
-        resolve(outputDir, `${issue.key}.json`),
-        `${JSON.stringify(issue, null, 2)}\n`,
-        "utf8"
-      );
+          if (response.status() === 401) {
+            throw new Error(
+              "Jira 로그인 세션이 만료됐습니다. npm run jira:login 후 다시 실행하세요."
+            );
+          }
+          if (response.status() === 403) {
+            throw new Error(`${issueKey} 조회 권한이 없습니다.`);
+          }
+          if (!response.ok()) {
+            throw new Error(
+              `${issueKey} Jira 조회 실패: HTTP ${response.status()} ${await response.text()}`
+            );
+          }
+
+          const source = await response.json();
+          const issue = normalizeJiraIssue(source);
+          results[index] = issue;
+        } catch (error) {
+          fatalError = error;
+        }
+      }
     }
+
+    const workerCount = Math.min(jiraFetchConcurrency, issueKeys.length);
+    await Promise.all(
+      Array.from({ length: workerCount }, () => worker())
+    );
+    if (fatalError) {
+      throw fatalError;
+    }
+    issues.push(...results);
+    console.log(
+      `[성능] Jira ${issues.length}건 병렬 조회 완료: ` +
+        `${Date.now() - startedAt}ms (동시 ${workerCount}건)`
+    );
   } finally {
     await context.close();
   }
@@ -228,15 +303,73 @@ async function syncIssuesToSheet(browserInstance, issues, config) {
   const page = await context.newPage();
 
   try {
-    const resolved = await resolveSheet(page, config.sheetUrl, config.sheetName);
+    const resolved = await resolveSheet(page, config.sheetUrl);
+    sheetMutationTargets.set(page, {
+      spreadsheetId: resolved.spreadsheetId,
+      gid: resolved.gid,
+      sheetName: resolved.sheetName
+    });
+    if (
+      config.workMode === WORK_MODE_NEW &&
+      newModeProtectedTemplateSheetNames.has(resolved.sheetName)
+    ) {
+      throw new Error(
+        `${resolved.sheetName} 탭은 신규 행 양식 기준 탭이므로 초기화할 수 없습니다.`
+      );
+    }
     const exportUrl =
       `https://docs.google.com/spreadsheets/d/${resolved.spreadsheetId}` +
       `/export?format=csv&gid=${resolved.gid}`;
     const nameBox = page.locator("#t-name-box");
     await nameBox.waitFor({ state: "visible", timeout: 20_000 });
     const results = [];
-    const initialRows = await readSheetRows(context.request, exportUrl);
-    const initialLayout = inspectLayout(initialRows);
+    let initialRows = await readSheetRows(context.request, exportUrl);
+    let initialLayout = inspectLayout(initialRows);
+    findDashboardDropdownSampleCell(initialRows, columnName);
+    if (config.workMode === WORK_MODE_NEW) {
+      initialRows = await initializeNewChecklistIssueArea(
+        page,
+        nameBox,
+        context.request,
+        exportUrl,
+        initialRows,
+        initialLayout
+      );
+      initialLayout = inspectLayout(initialRows);
+      const preparedSnapshot = await prepareNewChecklistSnapshotColumns(
+        page,
+        nameBox,
+        context.request,
+        exportUrl,
+        initialRows,
+        initialLayout,
+        config.snapshotName
+      );
+      initialRows = preparedSnapshot.rows;
+      initialLayout = preparedSnapshot.layout;
+    } else if (countIssueRows(initialRows, initialLayout, jiraKeyFromCell) === 0) {
+      throw new Error(
+        "시트에 기존 Jira 이슈가 없습니다. 작업 유형을 '신규 체크리스트에 최초 등록'으로 선택하세요."
+      );
+    }
+    const snapshotState = await ensureSnapshotWorkColumn(
+      page,
+      nameBox,
+      context.request,
+      exportUrl,
+      initialRows,
+      initialLayout,
+      new Set(issues.map((issue) => issue.key)),
+      config.snapshotName,
+      config.workMode
+    );
+    initialRows = snapshotState.rows;
+    initialLayout = withSnapshotWorkIndex(
+      snapshotState.layout,
+      snapshotState.snapshotWorkIndex
+    );
+    const snapshotDropdownSourceCell =
+      findDashboardDropdownSampleCell(initialRows, columnName);
     const schedule = await updateScheduleFields(
       page,
       nameBox,
@@ -244,14 +377,22 @@ async function syncIssuesToSheet(browserInstance, issues, config) {
       exportUrl,
       initialRows,
       initialLayout,
-      config
+      config.workMode === WORK_MODE_NEW
+        ? {
+            ...config,
+            deadline: config.deadline || "-",
+            resetSchedule: true
+          }
+        : config
     );
-    let sheetColumnCount = initialLayout.columnCount;
+    let currentRows = initialRows;
 
     for (const issue of issues) {
-      let rows = await readSheetRows(context.request, exportUrl);
-      const layout = inspectLayout(rows);
-      sheetColumnCount = layout.columnCount;
+      let rows = currentRows;
+      const layout = withSnapshotWorkIndex(
+        inspectLayout(rows),
+        snapshotState.snapshotWorkIndex
+      );
       let matches = findIssueMatches(rows, issue.key, layout);
 
       if (matches.length > 1) {
@@ -286,19 +427,58 @@ async function syncIssuesToSheet(browserInstance, issues, config) {
               jiraKeyFromCell(row[2]) !== ""
           )
           .map(({ index }) => index);
-        if (preparedBlankIndex == null && issueIndexes.length === 0) {
-          const firstIssueIndex = layout.headerIndex + 1;
-          if (
-            firstIssueIndex < layout.issueEndIndex &&
-            !rowHasContent(rows[firstIssueIndex])
-          ) {
-            preparedBlankIndex = firstIssueIndex;
-          }
-        }
         const lastIssueIndex = issueIndexes.at(-1);
         if (preparedBlankIndex != null) {
           targetIndex = preparedBlankIndex;
           preparedNumber = String(rows[targetIndex]?.[0] ?? "").trim();
+          if (
+            shouldUseTemplateForInsertedRow(
+              config.workMode,
+              lastIssueIndex
+            )
+          ) {
+            if (
+              config.workMode === WORK_MODE_NEW &&
+              lastIssueIndex != null
+            ) {
+              await copyPreparedNewChecklistRow(
+                page,
+                nameBox,
+                lastIssueIndex + 1,
+                targetIndex + 1,
+                layout.columnCount
+              );
+            } else {
+              await copyTemplateRowFromSheet(
+                page,
+                nameBox,
+                context.request,
+                {
+                  spreadsheetId: resolved.spreadsheetId,
+                  templateSheetName: defaultTemplateSheetName,
+                  snapshotDropdownSourceCell:
+                    snapshotDropdownSourceCell,
+                  targetSheetName: resolved.sheetName,
+                  targetRowNumber: targetIndex + 1,
+                  targetLayout: layout,
+                  issueType: issue.issueType
+                }
+              );
+            }
+          } else if (!preparedNumber) {
+            const matchingTypeIndex = findMatchingTypeRowIndex(
+              rows,
+              layout,
+              issue.issueType
+            );
+            await copyRowFormattingAndValidation(
+              page,
+              nameBox,
+              (matchingTypeIndex ?? lastIssueIndex) + 1,
+              targetIndex + 1,
+              layout.columnCount
+            );
+          }
         } else {
           const matchingTypeIndex = findMatchingTypeRowIndex(
             rows,
@@ -316,18 +496,40 @@ async function syncIssuesToSheet(browserInstance, issues, config) {
             targetIndex
           );
 
-          if (lastIssueIndex == null) {
-            await copyTemplateRowFromSheet(
-              page,
-              nameBox,
-              context.request,
-              resolved.spreadsheetId,
-              "스프레드시트양식",
-              config.sheetName,
-              targetIndex + 1,
-              layout,
-              issue.issueType
-            );
+          if (
+            shouldUseTemplateForInsertedRow(
+              config.workMode,
+              lastIssueIndex
+            )
+          ) {
+            if (
+              config.workMode === WORK_MODE_NEW &&
+              lastIssueIndex != null
+            ) {
+              await copyPreparedNewChecklistRow(
+                page,
+                nameBox,
+                lastIssueIndex + 1,
+                targetIndex + 1,
+                layout.columnCount
+              );
+            } else {
+              await copyTemplateRowFromSheet(
+                page,
+                nameBox,
+                context.request,
+                {
+                  spreadsheetId: resolved.spreadsheetId,
+                  templateSheetName: defaultTemplateSheetName,
+                  snapshotDropdownSourceCell:
+                    snapshotDropdownSourceCell,
+                  targetSheetName: resolved.sheetName,
+                  targetRowNumber: targetIndex + 1,
+                  targetLayout: layout,
+                  issueType: issue.issueType
+                }
+              );
+            }
           } else {
             await copyRowFormattingAndValidation(
               page,
@@ -345,7 +547,8 @@ async function syncIssuesToSheet(browserInstance, issues, config) {
         rows,
         layout,
         issue.issueType,
-        targetIndex
+        targetIndex,
+        config.workMode !== WORK_MODE_NEW
       );
       if (typeStyleSourceCell) {
         await copyCell(
@@ -354,9 +557,21 @@ async function syncIssuesToSheet(browserInstance, issues, config) {
           typeStyleSourceCell,
           `B${targetIndex + 1}`
         );
+      } else if (config.workMode === WORK_MODE_NEW) {
+        await copyTypeStyleFromTemplateSheet(
+          page,
+          nameBox,
+          context.request,
+          {
+            spreadsheetId: resolved.spreadsheetId,
+            templateSheetName: defaultTemplateSheetName,
+            targetSheetName: resolved.sheetName,
+            targetRowNumber: targetIndex + 1,
+            issueType: issue.issueType
+          }
+        );
       }
 
-      rows = await readSheetRows(context.request, exportUrl);
       const ordinal = rows
         .slice(layout.headerIndex + 1, targetIndex + 1)
         .filter((row) => jiraKeyFromCell(row[2]) !== "").length +
@@ -365,11 +580,11 @@ async function syncIssuesToSheet(browserInstance, issues, config) {
       const customer =
         action === "updated" && (rows[targetIndex]?.[3] ?? "") !== ""
           ? rows[targetIndex][3]
-          : inferCustomer(issue, config.sheetName, rows, layout);
+          : inferCustomer(issue, resolved.sheetName, rows, layout);
       const values = [
         preparedNumber || String(ordinal),
         issue.issueType,
-        issue.key,
+        `=HYPERLINK("${issue.url}","${issue.key}")`,
         customer,
         issue.title,
         issue.status,
@@ -378,64 +593,205 @@ async function syncIssuesToSheet(browserInstance, issues, config) {
       ];
 
       await pasteTsv(page, nameBox, `A${rowNumber}`, values.join("\t"));
-      await pasteTsv(
-        page,
-        nameBox,
-        `C${rowNumber}`,
-        `=HYPERLINK("${issue.url}","${issue.key}")`
+      const currentReferenceValue =
+        layout.referenceIndex >= 0
+          ? String(rows[targetIndex]?.[layout.referenceIndex] ?? "")
+              .trim()
+              .toUpperCase()
+          : "";
+      const expectedReferenceValue = referenceValueForRun(
+        currentReferenceValue,
+        action === "inserted"
       );
+      if (
+        layout.referenceIndex >= 0 &&
+        (action === "inserted" ||
+          !["Y", "N"].includes(currentReferenceValue))
+      ) {
+        await pasteTsv(
+          page,
+          nameBox,
+          `${columnName(layout.referenceIndex)}${rowNumber}`,
+          expectedReferenceValue
+        );
+      }
+      const previousSnapshotValue =
+        snapshotState.previousSnapshotIndex >= 0
+          ? rows[targetIndex]?.[snapshotState.previousSnapshotIndex] ?? ""
+          : "";
+      const currentSnapshotValue =
+        snapshotState.snapshotWorkIndex >= 0
+          ? rows[targetIndex]?.[snapshotState.snapshotWorkIndex] ?? ""
+          : "";
+      const resetSnapshot =
+        snapshotState.previousSnapshotIndex >= 0
+          ? shouldResetCarriedSnapshot(action, previousSnapshotValue)
+          : action === "inserted";
+      const targetSnapshotCell =
+        snapshotState.snapshotWorkIndex >= 0
+          ? `${columnName(snapshotState.snapshotWorkIndex)}${rowNumber}`
+          : null;
+      const templatePreparedSnapshot =
+        config.workMode === WORK_MODE_NEW && action === "inserted";
+      const resetBeforeInactiveStyle =
+        Boolean(targetSnapshotCell && resetSnapshot) &&
+        action === "inserted" &&
+        snapshotState.dropdownSourceCell == null &&
+        !templatePreparedSnapshot;
+      if (resetBeforeInactiveStyle) {
+        await copyBlankDropdownSample(
+          page,
+          nameBox,
+          snapshotDropdownSourceCell,
+          targetSnapshotCell
+        );
+      }
+      if (action === "inserted" && layout.snapshotIndexes.length > 0) {
+        await applyInactiveSnapshotCells(
+          page,
+          nameBox,
+          rows,
+          layout,
+          rowNumber,
+          snapshotState.historicalStyleSource,
+          snapshotState.snapshotWorkIndex
+        );
+      }
+      if (
+        targetSnapshotCell &&
+        resetSnapshot &&
+        !resetBeforeInactiveStyle &&
+        !templatePreparedSnapshot
+      ) {
+        await copyBlankDropdownSample(
+          page,
+          nameBox,
+          snapshotDropdownSourceCell,
+          targetSnapshotCell
+        );
+      }
       const verified = await waitForIssueRow(
         context.request,
         exportUrl,
         issue,
-        rowNumber
+        rowNumber,
+        snapshotState.snapshotWorkIndex >= 0
+          ? {
+              columnIndex: snapshotState.snapshotWorkIndex,
+              value: resetSnapshot
+                ? ""
+                : String(
+                    snapshotState.initialized
+                      ? carriedSnapshotValue(previousSnapshotValue)
+                      : currentSnapshotValue
+                  )
+            }
+          : null,
+        layout.referenceIndex >= 0
+          ? {
+              columnIndex: layout.referenceIndex,
+              value: expectedReferenceValue
+            }
+          : null
       );
+      currentRows = verified.rows;
+      const verifiedRow = verified.row;
       results.push({
         action,
         rowNumber,
-        number: verified[0],
+        number: verifiedRow[0],
         key: issue.key,
-        title: verified[4],
-        status: verified[5],
-        priority: verified[6],
-        assignee: verified[7]
+        title: verifiedRow[4],
+        status: verifiedRow[5],
+        priority: verifiedRow[6],
+        assignee: verifiedRow[7],
+        snapshotReset: resetSnapshot
       });
     }
 
-    const rowNumbers = results.map((item) => item.rowNumber);
-    const firstRow = Math.min(...rowNumbers);
-    const lastRow = Math.max(...rowNumbers);
-    await nameBox.fill(
-      `A${firstRow}:${columnName(sheetColumnCount - 1)}${lastRow}`
+    const performance = {
+      totalDurationMs: Date.now() - processStartedAt,
+      sheetReadCount,
+      sheetReadDurationMs
+    };
+    console.log(
+      `[성능] Google Sheets CSV 조회 ${sheetReadCount}회, ` +
+        `누적 ${sheetReadDurationMs}ms`
     );
-    await nameBox.press("Enter");
-    await page.waitForTimeout(750);
-    await mkdir(outputDir, { recursive: true });
-    const screenshotPath = resolve(
-      outputDir,
-      `sync-${new Date().toISOString().replace(/[:.]/g, "-")}.png`
-    );
-    await page.screenshot({ path: screenshotPath, fullPage: false });
-
     return {
+      sheetName: resolved.sheetName,
       resolvedSheetUrl: resolved.url,
+      snapshot: {
+        insertedColumn: snapshotState.inserted,
+        initializedValues: snapshotState.initialized,
+        previousColumn:
+          snapshotState.previousSnapshotIndex >= 0
+            ? columnName(snapshotState.previousSnapshotIndex)
+            : "",
+        workColumn:
+          snapshotState.snapshotWorkIndex >= 0
+            ? columnName(snapshotState.snapshotWorkIndex)
+            : "",
+        header: config.snapshotName
+      },
       schedule,
-      results,
-      screenshotPath
+      performance,
+      results
     };
   } finally {
     await context.close();
   }
 }
 
-async function resolveSheet(page, providedUrl, sheetName) {
-  await page.goto(providedUrl, {
+async function resolveSheet(page, providedUrl) {
+  const requested = parseGoogleSheetLink(providedUrl);
+  await page.goto(requested.canonicalUrl, {
     waitUntil: "domcontentloaded",
     timeout: 30_000
   });
-  await page.waitForTimeout(3_000);
 
-  return selectSheetByName(page, sheetName);
+  const tabs = page.locator(".docs-sheet-tab");
+  await tabs.first().waitFor({ state: "visible", timeout: 20_000 });
+  await page.waitForTimeout(500);
+
+  const current = parseGoogleSheetLink(page.url());
+  if (
+    current.spreadsheetId !== requested.spreadsheetId ||
+    current.gid !== requested.gid
+  ) {
+    throw new Error(
+      `Google Sheets 링크의 대상 탭을 열지 못했습니다. ` +
+        `요청 gid=${requested.gid}, 현재 gid=${current.gid}`
+    );
+  }
+
+  let activeTab = page.locator(
+    ".docs-sheet-tab.docs-sheet-active-tab"
+  ).first();
+  if ((await activeTab.count()) === 0) {
+    activeTab = page.locator(
+      '.docs-sheet-tab[aria-selected="true"]'
+    ).first();
+  }
+  if ((await activeTab.count()) === 0) {
+    throw new Error(
+      `Google Sheets에서 gid=${requested.gid}인 활성 탭을 확인하지 못했습니다.`
+    );
+  }
+  const sheetName = (await activeTab.innerText()).trim();
+  if (!sheetName) {
+    throw new Error(
+      `Google Sheets에서 gid=${requested.gid}인 탭 이름을 확인하지 못했습니다.`
+    );
+  }
+
+  console.log(`[대상 시트 자동 감지] ${sheetName} (gid=${requested.gid})`);
+  return {
+    spreadsheetId: requested.spreadsheetId,
+    gid: requested.gid,
+    sheetName,
+    url: requested.canonicalUrl
+  };
 }
 
 async function selectSheetByName(page, sheetName) {
@@ -467,7 +823,7 @@ async function selectSheetByName(page, sheetName) {
   }
 
   await targetTab.click();
-  await page.waitForTimeout(1_500);
+  await page.waitForTimeout(650);
   const url = page.url();
   const match = url.match(
     /\/spreadsheets\/d\/([^/]+)\/.*(?:[?#&]gid=)(\d+)/
@@ -480,6 +836,33 @@ async function selectSheetByName(page, sheetName) {
     gid: match[2],
     url
   };
+}
+
+async function assertTargetSheetMutation(page, operation) {
+  const expected = sheetMutationTargets.get(page);
+  let current = null;
+  try {
+    current = parseGoogleSheetLink(page.url());
+  } catch {
+    current = null;
+  }
+  let activeTab = page.locator(
+    ".docs-sheet-tab.docs-sheet-active-tab"
+  ).first();
+  if ((await activeTab.count()) === 0) {
+    activeTab = page.locator(
+      '.docs-sheet-tab[aria-selected="true"]'
+    ).first();
+  }
+  const activeSheetName =
+    (await activeTab.count()) > 0
+      ? (await activeTab.innerText()).trim()
+      : "";
+  try {
+    assertSheetMutationTarget(expected, current, activeSheetName);
+  } catch (error) {
+    throw new Error(`${operation}: ${error.message}`);
+  }
 }
 
 function normalizeSheetName(value) {
@@ -504,9 +887,15 @@ function inspectLayout(rows) {
     );
   }
   const header = rows[headerIndex] ?? [];
+  const snapshotWorkHeaderIndex = header.findIndex((value) =>
+    isSnapshotWorkHeader(value)
+  );
   const snapshotIndexes = header
     .map((value, index) => ({ value: String(value ?? ""), index }))
-    .filter(({ value }) => /^SNAPSHOT/i.test(value))
+    .filter(
+      ({ value, index }) =>
+        /^SNAPSHOT/i.test(value) && index !== snapshotWorkHeaderIndex
+    )
     .map(({ index }) => index);
   let referenceIndex = -1;
   for (let rowIndex = 0; rowIndex <= headerIndex; rowIndex += 1) {
@@ -536,17 +925,34 @@ function inspectLayout(rows) {
         (value) => String(value ?? "").trim() === "참고사항"
       )
   );
+  const blankSnapshotWorkIndex = findBlankSnapshotWorkIndex(
+    header,
+    snapshotIndexes,
+    referenceIndex
+  );
   return {
     headerIndex,
     issueEndIndex: issueEndIndex >= 0 ? issueEndIndex : rows.length,
     snapshotIndexes,
+    snapshotWorkIndex:
+      blankSnapshotWorkIndex >= 0
+        ? blankSnapshotWorkIndex
+        : snapshotIndexes.at(-1) ?? -1,
+    hasBlankSnapshotWorkColumn: blankSnapshotWorkIndex >= 0,
     referenceIndex,
     columnCount
   };
 }
 
+function withSnapshotWorkIndex(layout, snapshotWorkIndex) {
+  return {
+    ...layout,
+    snapshotWorkIndex
+  };
+}
+
 function normalizeType(value) {
-  return String(value ?? "").replace(/\s+/g, "").toLowerCase();
+  return normalizeIssueTypeForStyle(value);
 }
 
 function findMatchingTypeRowIndex(
@@ -573,7 +979,13 @@ function findMatchingTypeRowIndex(
   return matching.at(-1) ?? null;
 }
 
-function findTypeStyleSourceCell(rows, layout, issueType, excludedIndex = -1) {
+function findTypeStyleSourceCell(
+  rows,
+  layout,
+  issueType,
+  excludedIndex = -1,
+  allowNeutralFallback = true
+) {
   const matchingIssueIndex = findMatchingTypeRowIndex(
     rows,
     layout,
@@ -583,20 +995,18 @@ function findTypeStyleSourceCell(rows, layout, issueType, excludedIndex = -1) {
   if (matchingIssueIndex != null) {
     return `B${matchingIssueIndex + 1}`;
   }
-
-  const expected = normalizeType(issueType);
-  for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
-    if (rowIndex === excludedIndex) {
-      continue;
-    }
-    const columnIndex = (rows[rowIndex] ?? []).findIndex(
-      (value) => normalizeType(value) === expected
-    );
-    if (columnIndex >= 0) {
-      return `${columnName(columnIndex)}${rowIndex + 1}`;
-    }
+  if (!allowNeutralFallback) {
+    return null;
   }
-  return null;
+
+  const neutralIssueIndex = rows.findIndex(
+    (row, index) =>
+      index > layout.headerIndex &&
+      index < layout.issueEndIndex &&
+      index !== excludedIndex &&
+      jiraKeyFromCell(row[2]) !== ""
+  );
+  return neutralIssueIndex >= 0 ? `B${neutralIssueIndex + 1}` : null;
 }
 
 function findPreparedBlankRowIndex(rows, layout) {
@@ -610,11 +1020,688 @@ function findPreparedBlankRowIndex(rows, layout) {
     const issueFieldsAreBlank = row
       .slice(1, 8)
       .every((value) => String(value ?? "").trim() === "");
-    if (hasPreparedNumber && issueFieldsAreBlank) {
+    const entireIssueRowIsBlank = row
+      .slice(0, layout.columnCount)
+      .every((value) => String(value ?? "").trim() === "");
+    const blankRowsFromHere = rows
+      .slice(index, layout.issueEndIndex)
+      .filter((candidateRow) =>
+        (candidateRow ?? [])
+          .slice(0, layout.columnCount)
+          .every((value) => String(value ?? "").trim() === "")
+      ).length;
+    if (
+      (hasPreparedNumber && issueFieldsAreBlank) ||
+      (entireIssueRowIsBlank && blankRowsFromHere > 4)
+    ) {
       return index;
     }
   }
   return null;
+}
+
+async function initializeNewChecklistIssueArea(
+  page,
+  nameBox,
+  request,
+  exportUrl,
+  rows,
+  layout
+) {
+  const firstIssueRowNumber = layout.headerIndex + 2;
+  const lastIssueRowNumber = layout.issueEndIndex;
+  if (lastIssueRowNumber < firstIssueRowNumber) {
+    return rows;
+  }
+  const lastColumn = columnName(layout.columnCount - 1);
+  const targetRange =
+    `A${firstIssueRowNumber}:${lastColumn}${lastIssueRowNumber}`;
+  await clearRange(page, nameBox, targetRange);
+  console.log(`[신규 체크리스트 초기화] 이슈 영역 값 삭제: ${targetRange}`);
+
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    const refreshedRows = await readSheetRows(request, exportUrl);
+    const refreshedLayout = inspectLayout(refreshedRows);
+    if (countIssueRows(refreshedRows, refreshedLayout, jiraKeyFromCell) === 0) {
+      return refreshedRows;
+    }
+    await page.waitForTimeout(1_500);
+  }
+  throw new Error("신규 체크리스트의 기존 이슈 값을 초기화하지 못했습니다.");
+}
+
+async function prepareNewChecklistSnapshotColumns(
+  page,
+  nameBox,
+  request,
+  exportUrl,
+  rows,
+  layout,
+  requestedSnapshotName
+) {
+  const header = rows[layout.headerIndex] ?? [];
+  const plan = planNewChecklistSnapshotColumns(
+    header,
+    layout.referenceIndex
+  );
+  let currentRows = rows;
+  let currentLayout = layout;
+
+  for (const columnIndex of plan.deleteIndexes) {
+    if (
+      currentLayout.referenceIndex < 0 ||
+      columnIndex >= currentLayout.referenceIndex
+    ) {
+      throw new Error(
+        `신규 체크리스트의 SNAPSHOT 열 위치를 확인하지 못했습니다: ` +
+          `${columnName(columnIndex)}열`
+      );
+    }
+    const column = columnName(columnIndex);
+    const expectedReferenceIndex = currentLayout.referenceIndex - 1;
+    await nameBox.fill(`${column}:${column}`);
+    await nameBox.press("Enter");
+    await page.waitForTimeout(300);
+    await assertTargetSheetMutation(page, `SNAPSHOT ${column}열 삭제`);
+    await page.keyboard.press("Control+Alt+Minus");
+    currentRows = await waitForDeletedSnapshotColumn(
+      request,
+      exportUrl,
+      expectedReferenceIndex
+    );
+    currentLayout = inspectLayout(currentRows);
+    console.log(`[신규 SNAPSHOT 열 정리] ${column}열 삭제`);
+  }
+
+  if (plan.keepIndex >= 0) {
+    if (currentLayout.referenceIndex !== plan.keepIndex + 1) {
+      throw new Error(
+        `신규 체크리스트의 SNAPSHOT 열을 하나로 정리하지 못했습니다. ` +
+          `SNAPSHOT=${columnName(plan.keepIndex)}열, ` +
+          `참고사항=${columnName(currentLayout.referenceIndex)}열`
+      );
+    }
+    const targetCell =
+      `${columnName(plan.keepIndex)}${currentLayout.headerIndex + 1}`;
+    const currentHeader = String(
+      currentRows[currentLayout.headerIndex]?.[plan.keepIndex] ?? ""
+    )
+      .trim()
+      .toUpperCase();
+    if (currentHeader !== requestedSnapshotName) {
+      await enterCellText(
+        page,
+        nameBox,
+        targetCell,
+        requestedSnapshotName
+      );
+      currentRows = await waitForRequestedSnapshotHeader(
+        request,
+        exportUrl,
+        plan.keepIndex,
+        requestedSnapshotName
+      );
+      currentLayout = inspectLayout(currentRows);
+    }
+    console.log(
+      `[신규 SNAPSHOT 열 유지] ${columnName(plan.keepIndex)}열 = ` +
+        requestedSnapshotName
+    );
+  }
+
+  return {
+    rows: currentRows,
+    layout: currentLayout
+  };
+}
+
+async function waitForDeletedSnapshotColumn(
+  request,
+  exportUrl,
+  expectedReferenceIndex
+) {
+  const deadline = Date.now() + 60_000;
+  while (Date.now() < deadline) {
+    const rows = await readSheetRows(request, exportUrl);
+    const layout = inspectLayout(rows);
+    if (layout.referenceIndex === expectedReferenceIndex) {
+      return rows;
+    }
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 1_500));
+  }
+  throw new Error(
+    `신규 체크리스트의 기존 SNAPSHOT/빈 열을 삭제하지 못했습니다. ` +
+      `예상 참고사항 열=${columnName(expectedReferenceIndex)}`
+  );
+}
+
+async function ensureSnapshotWorkColumn(
+  page,
+  nameBox,
+  request,
+  exportUrl,
+  rows,
+  layout,
+  inputIssueKeys,
+  requestedSnapshotName,
+  workMode
+) {
+  let header = rows[layout.headerIndex] ?? [];
+  const plan = planRequestedSnapshotColumn(
+    header,
+    layout.referenceIndex,
+    requestedSnapshotName
+  );
+  let inserted = false;
+  let snapshotWorkIndex = plan.targetIndex;
+
+  if (plan.action === "insert") {
+    if (layout.referenceIndex < 0) {
+      throw new Error(
+        "SNAPSHOT 열을 추가할 기준인 참고사항여부 열을 찾지 못했습니다."
+      );
+    }
+    const targetColumn = columnName(snapshotWorkIndex);
+    await nameBox.fill(`${targetColumn}:${targetColumn}`);
+    await nameBox.press("Enter");
+    await page.waitForTimeout(300);
+    await assertTargetSheetMutation(page, `SNAPSHOT ${targetColumn}열 추가`);
+    await page.keyboard.press("Control+Alt+Equal");
+    await page.waitForTimeout(1_000);
+    inserted = true;
+
+    rows = await waitForInsertedColumnAt(
+      request,
+      exportUrl,
+      snapshotWorkIndex,
+      layout.referenceIndex + 1
+    );
+    layout = inspectLayout(rows);
+    console.log(
+      `[SNAPSHOT 열 생성] ${columnName(snapshotWorkIndex)}열, ` +
+        `참고사항여부=${columnName(layout.referenceIndex)}열`
+    );
+  }
+
+  const currentHeader = String(
+    rows[layout.headerIndex]?.[snapshotWorkIndex] ?? ""
+  )
+    .trim()
+    .toUpperCase();
+  if (currentHeader !== requestedSnapshotName) {
+    await enterCellText(
+      page,
+      nameBox,
+      `${columnName(snapshotWorkIndex)}${layout.headerIndex + 1}`,
+      requestedSnapshotName
+    );
+    rows = await waitForRequestedSnapshotHeader(
+      request,
+      exportUrl,
+      snapshotWorkIndex,
+      requestedSnapshotName
+    );
+    layout = inspectLayout(rows);
+    console.log(
+      `[SNAPSHOT 헤더 설정] ${columnName(snapshotWorkIndex)}열 = ${requestedSnapshotName}`
+    );
+  }
+
+  header = rows[layout.headerIndex] ?? [];
+  const previousSnapshotIndex = findPreviousSnapshotIndex(
+    header,
+    snapshotWorkIndex
+  );
+  layout = withSnapshotWorkIndex(layout, snapshotWorkIndex);
+  const issueCount = countIssueRows(rows, layout, jiraKeyFromCell);
+  const existingWorkColumnHasValues = rows
+    .slice(layout.headerIndex + 1, layout.issueEndIndex)
+    .some((row) => String(row[snapshotWorkIndex] ?? "").trim() !== "");
+  const initialized =
+    workMode !== WORK_MODE_NEW &&
+    previousSnapshotIndex >= 0 &&
+    issueCount > 0 &&
+    !existingWorkColumnHasValues;
+  const historicalStyleSource = findHistoricalInactiveStyleSource(rows, layout);
+
+  if (initialized) {
+    await copySnapshotColumn(
+      page,
+      nameBox,
+      previousSnapshotIndex,
+      snapshotWorkIndex,
+      layout.headerIndex + 2,
+      layout.issueEndIndex
+    );
+    await writeCarriedSnapshotValues(
+      page,
+      nameBox,
+      rows,
+      layout,
+      previousSnapshotIndex,
+      snapshotWorkIndex,
+      inputIssueKeys
+    );
+    rows = await waitForSnapshotCarryValues(
+      request,
+      exportUrl,
+      rows,
+      layout,
+      previousSnapshotIndex,
+      snapshotWorkIndex,
+      inputIssueKeys,
+      page,
+      nameBox,
+      requestedSnapshotName
+    );
+    layout = inspectLayout(rows);
+    layout = withSnapshotWorkIndex(layout, snapshotWorkIndex);
+  } else if (
+    workMode !== WORK_MODE_NEW &&
+    previousSnapshotIndex >= 0 &&
+    existingWorkColumnHasValues
+  ) {
+    const repairedMutations = await repairCopiedSnapshotValues(
+      page,
+      nameBox,
+      rows,
+      layout,
+      previousSnapshotIndex,
+      snapshotWorkIndex
+    );
+    if (repairedMutations.length > 0) {
+      rows = await waitForSnapshotMutationValues(
+        request,
+        exportUrl,
+        snapshotWorkIndex,
+        repairedMutations
+      );
+      layout = inspectLayout(rows);
+      layout = withSnapshotWorkIndex(layout, snapshotWorkIndex);
+    }
+  }
+
+  const dropdownSourceIndex =
+    previousSnapshotIndex >= 0 ? previousSnapshotIndex : snapshotWorkIndex;
+  const preferredDropdownSourceRowIndex = rows.findIndex(
+    (row, index) =>
+      index > layout.headerIndex &&
+      index < layout.issueEndIndex &&
+      jiraKeyFromCell(row[2]) !== "" &&
+      isKnownSnapshotDropdownValue(row[dropdownSourceIndex])
+  );
+  const fallbackDropdownSourceRowIndex = rows.findIndex(
+    (row, index) =>
+      index > layout.headerIndex &&
+      index < layout.issueEndIndex &&
+      jiraKeyFromCell(row[2]) !== ""
+  );
+  const dropdownSourceRowIndex =
+    preferredDropdownSourceRowIndex >= 0
+      ? preferredDropdownSourceRowIndex
+      : fallbackDropdownSourceRowIndex;
+  const dropdownSourceCell =
+    dropdownSourceRowIndex >= 0
+      ? `${columnName(dropdownSourceIndex)}${dropdownSourceRowIndex + 1}`
+      : null;
+
+  return {
+    rows,
+    layout,
+    previousSnapshotIndex,
+    snapshotWorkIndex,
+    dropdownSourceCell,
+    inserted,
+    initialized,
+    historicalStyleSource
+  };
+}
+
+async function repairCopiedSnapshotValues(
+  page,
+  nameBox,
+  sourceRows,
+  layout,
+  previousSnapshotIndex,
+  snapshotWorkIndex
+) {
+  const mutations = [];
+  for (
+    let rowIndex = layout.headerIndex + 1;
+    rowIndex < layout.issueEndIndex;
+    rowIndex += 1
+  ) {
+    const row = sourceRows[rowIndex] ?? [];
+    const jiraKey = jiraKeyFromCell(row[2]);
+    if (!jiraKey) {
+      continue;
+    }
+    const previousValue = String(row[previousSnapshotIndex] ?? "");
+    const currentValue = String(row[snapshotWorkIndex] ?? "");
+    const expectedValue = copiedSnapshotRepairValue(
+      previousValue,
+      currentValue
+    );
+    if (expectedValue == null) {
+      continue;
+    }
+    mutations.push({
+      rowIndex,
+      jiraKey,
+      previousValue,
+      value: expectedValue,
+      sourceCell: `${columnName(previousSnapshotIndex)}${rowIndex + 1}`,
+      targetCell: `${columnName(snapshotWorkIndex)}${rowIndex + 1}`
+    });
+  }
+
+  for (const mutation of mutations) {
+    if (mutation.value === "") {
+      await resetSnapshotDropdownValue(
+        page,
+        nameBox,
+        mutation.sourceCell,
+        mutation.targetCell
+      );
+    } else {
+      await pasteTsv(page, nameBox, mutation.targetCell, mutation.value);
+    }
+    console.log(
+      `[SNAPSHOT 복사값 보정] ${mutation.jiraKey}: ` +
+        `${mutation.previousValue} -> ${mutation.value} (${mutation.targetCell})`
+    );
+  }
+  return mutations;
+}
+
+async function waitForSnapshotMutationValues(
+  request,
+  exportUrl,
+  snapshotWorkIndex,
+  mutations
+) {
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    const rows = await readSheetRows(request, exportUrl);
+    const complete = mutations.every(
+      ({ rowIndex, value }) =>
+        String(rows[rowIndex]?.[snapshotWorkIndex] ?? "") === value
+    );
+    if (complete) {
+      return rows;
+    }
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 1_500));
+  }
+  const first = mutations[0];
+  throw new Error(
+    `기존 SNAPSHOT 복사값을 보정하지 못했습니다: ` +
+      `${first?.jiraKey ?? "-"}, 예상값=${first?.value ?? ""}`
+  );
+}
+
+async function writeCarriedSnapshotValues(
+  page,
+  nameBox,
+  sourceRows,
+  layout,
+  previousSnapshotIndex,
+  snapshotWorkIndex,
+  inputIssueKeys
+) {
+  const issueRows = sourceRows.slice(
+    layout.headerIndex + 1,
+    layout.issueEndIndex
+  );
+  if (issueRows.length === 0) {
+    return;
+  }
+  const targetColumn = columnName(snapshotWorkIndex);
+  const mutations = [];
+  for (let offset = 0; offset < issueRows.length; offset += 1) {
+    const row = issueRows[offset] ?? [];
+    const previousValue = row[previousSnapshotIndex];
+    const rowNumber = layout.headerIndex + 2 + offset;
+    const action = snapshotCarryAction(
+      previousValue,
+      previousValue,
+      inputIssueKeys.has(jiraKeyFromCell(row[2]))
+    );
+    if (action.type === "none") {
+      continue;
+    }
+    mutations.push({
+      ...action,
+      offset,
+      rowNumber,
+      sourceCell: `${columnName(previousSnapshotIndex)}${rowNumber}`,
+      targetCell: `${targetColumn}${rowNumber}`,
+      jiraKey: jiraKeyFromCell(row[2]),
+      previousValue: String(previousValue ?? "")
+    });
+  }
+
+  for (let index = 0; index < mutations.length; ) {
+    const first = mutations[index];
+    const group = [first];
+    index += 1;
+    while (
+      index < mutations.length &&
+      mutations[index].type === first.type &&
+      mutations[index].offset === group.at(-1).offset + 1
+    ) {
+      group.push(mutations[index]);
+      index += 1;
+    }
+
+    if (first.type === "clear") {
+      for (const item of group) {
+        await resetSnapshotDropdownValue(
+          page,
+          nameBox,
+          item.sourceCell,
+          item.targetCell
+        );
+      }
+    } else {
+      await pasteTsv(
+        page,
+        nameBox,
+        first.targetCell,
+        group.map((item) => item.value).join("\n")
+      );
+    }
+  }
+
+  for (const mutation of mutations) {
+    console.log(
+      `[SNAPSHOT 승계] ${mutation.jiraKey || mutation.targetCell}: ` +
+        `${mutation.previousValue} -> ${mutation.value} (${mutation.targetCell})`
+    );
+  }
+  console.log(
+    `[성능] SNAPSHOT ${issueRows.length}개 행 중 ` +
+      `${mutations.length}개 변경값을 연속 범위 단위로 일괄 반영`
+  );
+}
+
+async function waitForInsertedColumnAt(
+  request,
+  exportUrl,
+  expectedColumnIndex,
+  expectedReferenceIndex
+) {
+  const deadline = Date.now() + 60_000;
+  while (Date.now() < deadline) {
+    const rows = await readSheetRows(request, exportUrl);
+    const layout = inspectLayout(rows);
+    if (
+      layout.referenceIndex === expectedReferenceIndex &&
+      expectedColumnIndex < layout.referenceIndex
+    ) {
+      return rows;
+    }
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 2_000));
+  }
+  throw new Error("새 SNAPSHOT 열을 삽입하지 못했습니다.");
+}
+
+async function waitForRequestedSnapshotHeader(
+  request,
+  exportUrl,
+  expectedSnapshotWorkIndex,
+  requestedSnapshotName
+) {
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    const rows = await readSheetRows(request, exportUrl);
+    const layout = inspectLayout(rows);
+    const headerValue =
+      rows[layout.headerIndex]?.[expectedSnapshotWorkIndex] ?? "";
+    if (
+      String(headerValue).trim().toUpperCase() === requestedSnapshotName
+    ) {
+      return rows;
+    }
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 1_500));
+  }
+  throw new Error(
+    `새 SNAPSHOT 열 헤더를 설정하지 못했습니다: ` +
+      `${columnName(expectedSnapshotWorkIndex)}열, 헤더=${requestedSnapshotName}`
+  );
+}
+
+async function copySnapshotColumn(
+  page,
+  nameBox,
+  sourceColumnIndex,
+  targetColumnIndex,
+  firstRowNumber,
+  lastRowNumber
+) {
+  const sourceColumn = columnName(sourceColumnIndex);
+  const targetColumn = columnName(targetColumnIndex);
+  await nameBox.fill(
+    `${sourceColumn}${firstRowNumber}:${sourceColumn}${lastRowNumber}`
+  );
+  await nameBox.press("Enter");
+  await page.keyboard.press("Control+C");
+  await page.waitForTimeout(500);
+  await nameBox.fill(`${targetColumn}${firstRowNumber}`);
+  await nameBox.press("Enter");
+  await assertTargetSheetMutation(
+    page,
+    `SNAPSHOT ${targetColumn}열 값 붙여넣기`
+  );
+  await page.keyboard.press("Control+V");
+  await page.waitForTimeout(1_500);
+  console.log(
+    `[SNAPSHOT 이슈 셀 복사] ` +
+      `${sourceColumn}${firstRowNumber}:${sourceColumn}${lastRowNumber} → ` +
+      `${targetColumn}${firstRowNumber}`
+  );
+}
+
+async function waitForSnapshotCarryValues(
+  request,
+  exportUrl,
+  sourceRows,
+  layout,
+  previousSnapshotIndex,
+  snapshotWorkIndex,
+  inputIssueKeys,
+  page,
+  nameBox,
+  requestedSnapshotName
+) {
+  const expected = sourceRows
+    .slice(layout.headerIndex + 1, layout.issueEndIndex)
+    .map((row, offset) => ({
+      rowIndex: layout.headerIndex + 1 + offset,
+      jiraKey: jiraKeyFromCell(row[2]),
+      targetCell:
+        `${columnName(snapshotWorkIndex)}${layout.headerIndex + 2 + offset}`,
+      sourceCell:
+        `${columnName(previousSnapshotIndex)}${layout.headerIndex + 2 + offset}`,
+      value: snapshotValueForRun(
+        row[previousSnapshotIndex],
+        inputIssueKeys.has(jiraKeyFromCell(row[2]))
+      )
+    }))
+    .filter((item) => item.jiraKey !== "");
+  if (expected.length === 0) {
+    return readSheetRows(request, exportUrl);
+  }
+
+  const deadline = Date.now() + 90_000;
+  let retryCount = 0;
+  let nextRetryAt = Date.now() + 8_000;
+  let lastMismatch = null;
+  while (Date.now() < deadline) {
+    const rows = await readSheetRows(request, exportUrl);
+    const currentLayout = inspectLayout(rows);
+    const currentHeader = String(
+      rows[currentLayout.headerIndex]?.[snapshotWorkIndex] ?? ""
+    )
+      .trim()
+      .toUpperCase();
+    if (currentHeader !== requestedSnapshotName) {
+      throw new Error(
+        `등록 SNAPSHOT 헤더가 유지되지 않았습니다. ` +
+          `작업 열=${columnName(snapshotWorkIndex)}, ` +
+          `예상=${requestedSnapshotName}, 실제=${currentHeader || "(빈값)"}`
+      );
+    }
+    const mismatches = expected.filter(
+      ({ rowIndex, value }) =>
+        String(rows[rowIndex]?.[snapshotWorkIndex] ?? "") !== value
+    );
+    lastMismatch = mismatches[0] ?? null;
+    if (!lastMismatch) {
+      console.log(
+        `[SNAPSHOT 최종값 검증 완료] ${expected.length}개 이슈`
+      );
+      return rows;
+    }
+    if (retryCount < 2 && Date.now() >= nextRetryAt) {
+      retryCount += 1;
+      console.log(
+        `[SNAPSHOT 재시도 ${retryCount}/2] ` +
+          mismatches
+            .map(
+              ({ jiraKey, targetCell, value }) =>
+                `${jiraKey || targetCell}=${value}`
+            )
+            .join(", ")
+      );
+      for (const mismatch of mismatches) {
+        if (mismatch.value === "") {
+          await resetSnapshotDropdownValue(
+            page,
+            nameBox,
+            mismatch.sourceCell,
+            mismatch.targetCell
+          );
+        } else {
+          await selectDropdownValue(
+            page,
+            nameBox,
+            mismatch.targetCell,
+            mismatch.value
+          );
+        }
+      }
+      nextRetryAt = Date.now() + 15_000;
+    }
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 2_000));
+  }
+  throw new Error(
+    `이전 SNAPSHOT 값을 새 열로 복사하지 못했습니다.` +
+      (lastMismatch
+        ? ` 확인 실패: ${lastMismatch.jiraKey}, ` +
+          `셀=${lastMismatch.targetCell}, 예상값=${lastMismatch.value}`
+        : "")
+  );
 }
 
 async function insertSheetRowBefore(
@@ -636,6 +1723,7 @@ async function insertSheetRowBefore(
   await nameBox.fill(`${rowNumber}:${rowNumber}`);
   await nameBox.press("Enter");
   await page.waitForTimeout(300);
+  await assertTargetSheetMutation(page, `${rowNumber}행 삽입`);
   await page.keyboard.press("Control+Alt+Equal");
   await page.waitForTimeout(1_000);
 
@@ -685,7 +1773,10 @@ async function updateScheduleFields(
       label: "테스트시작일",
       target: (cell) => ({
         row: cell.row,
-        column: layout.snapshotIndexes.at(-1) ?? cell.column + 1
+        column:
+          layout.snapshotWorkIndex >= 0
+            ? layout.snapshotWorkIndex
+            : cell.column + 1
       })
     },
     {
@@ -694,10 +1785,13 @@ async function updateScheduleFields(
       label: "테스트종료일",
       target: (cell) => ({
         row: cell.row,
-        column: layout.snapshotIndexes.at(-1) ?? cell.column + 1
+        column:
+          layout.snapshotWorkIndex >= 0
+            ? layout.snapshotWorkIndex
+            : cell.column + 1
       })
     }
-  ].filter((item) => item.value);
+  ].filter((item) => item.value || config.resetSchedule === true);
 
   const updated = {};
   for (const item of requested) {
@@ -707,7 +1801,11 @@ async function updateScheduleFields(
     }
     const target = item.target(labelCell);
     const targetCell = `${columnName(target.column)}${target.row + 1}`;
-    await pasteTsv(page, nameBox, targetCell, item.value);
+    if (item.value === "") {
+      await clearRange(page, nameBox, targetCell);
+    } else {
+      await pasteTsv(page, nameBox, targetCell, item.value);
+    }
     updated[item.key] = { cell: targetCell, value: item.value };
   }
 
@@ -754,6 +1852,11 @@ function comparableDate(value) {
   return String(value ?? "").match(/\d+/g)?.map(Number).join(".") ?? "";
 }
 
+function comparableScheduleValue(value) {
+  const text = String(value ?? "").trim();
+  return /\d/.test(text) ? comparableDate(text) : text;
+}
+
 async function waitForScheduleValues(request, exportUrl, updated) {
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {
@@ -762,8 +1865,9 @@ async function waitForScheduleValues(request, exportUrl, updated) {
     const complete = Object.values(updated).every((details) => {
       const coordinates = parseCellAddress(details.cell);
       return (
-        comparableDate(rows[coordinates.row]?.[coordinates.column]) ===
-        comparableDate(details.value)
+        comparableScheduleValue(
+          rows[coordinates.row]?.[coordinates.column]
+        ) === comparableScheduleValue(details.value)
       );
     });
     if (complete) {
@@ -780,8 +1884,140 @@ async function copyCell(page, nameBox, sourceCell, targetCell) {
   await page.waitForTimeout(300);
   await nameBox.fill(targetCell);
   await nameBox.press("Enter");
+  await assertTargetSheetMutation(page, `${targetCell} 셀 복사`);
   await page.keyboard.press("Control+V");
   await page.waitForTimeout(500);
+}
+
+async function clearRange(page, nameBox, targetRange) {
+  await nameBox.fill(targetRange);
+  await nameBox.press("Enter");
+  await assertTargetSheetMutation(page, `${targetRange} 값 삭제`);
+  await page.keyboard.press("Delete");
+  await page.waitForTimeout(400);
+}
+
+async function clearDropdownValue(page, nameBox, targetRange) {
+  // Delete는 셀 값만 제거하므로 복사된 드롭다운(데이터 유효성 검사)은 유지된다.
+  await clearRange(page, nameBox, targetRange);
+  console.log(`[SNAPSHOT 드롭다운 빈값 설정] ${targetRange}`);
+}
+
+async function resetSnapshotDropdownValue(
+  page,
+  nameBox,
+  sourceCell,
+  targetCell
+) {
+  if (!sourceCell) {
+    throw new Error(
+      `${targetCell}을 빈 드롭다운으로 만들 원본 SNAPSHOT 셀을 찾지 못했습니다.`
+    );
+  }
+  if (sourceCell !== targetCell) {
+    await copyCell(page, nameBox, sourceCell, targetCell);
+  }
+  await clearDropdownValue(page, nameBox, targetCell);
+}
+
+async function copyBlankDropdownSample(
+  page,
+  nameBox,
+  sourceCell,
+  targetCell
+) {
+  await copyCell(page, nameBox, sourceCell, targetCell);
+  console.log(`[SNAPSHOT 빈 드롭다운 복사] ${sourceCell} → ${targetCell}`);
+}
+
+async function setCellFillColor(page, nameBox, targetRange, colorName) {
+  await nameBox.fill(targetRange);
+  await nameBox.press("Enter");
+  await page.waitForTimeout(250);
+  await assertTargetSheetMutation(
+    page,
+    `${targetRange} 배경색 ${colorName} 적용`
+  );
+
+  const fillColorButton = page
+    .locator(
+      '#t-cell-color, [aria-label*="채우기 색상"], [aria-label*="Fill color"]'
+    )
+    .filter({ visible: true })
+    .first();
+  await fillColorButton.waitFor({ state: "visible", timeout: 5_000 });
+  const menuTrigger = fillColorButton
+    .locator(
+      '.goog-toolbar-menu-button-dropdown, [aria-haspopup="menu"], [role="button"]'
+    )
+    .filter({ visible: true })
+    .first();
+  if (await menuTrigger.isVisible().catch(() => false)) {
+    await menuTrigger.click();
+  } else {
+    await fillColorButton.click();
+  }
+
+  const colorOption = page
+    .locator(
+      [
+        `.goog-palette-cell[aria-label*="${colorName}"]`,
+        `.docs-material-colorpalette-colorswatch[aria-label*="${colorName}"]`,
+        `[role="gridcell"][aria-label*="${colorName}"]`,
+        `.goog-palette-cell[title*="${colorName}"]`,
+        '.goog-palette-cell[aria-label*="Dark gray 3"]',
+        '.docs-material-colorpalette-colorswatch[aria-label*="Dark gray 3"]',
+        '[role="gridcell"][aria-label*="Dark gray 3"]',
+        '.goog-palette-cell [style*="rgb(102, 102, 102)"]',
+        '.goog-palette-cell [style*="#666666"]'
+      ].join(", ")
+    )
+    .filter({ visible: true })
+    .first();
+  try {
+    await colorOption.waitFor({ state: "visible", timeout: 5_000 });
+    await colorOption.click();
+    await page.waitForTimeout(500);
+  } catch (error) {
+    await page.keyboard.press("Escape").catch(() => {});
+    throw new Error(
+      `${targetRange}의 배경색을 ${colorName}으로 설정하지 못했습니다: ` +
+        error.message
+    );
+  }
+}
+
+async function applyInactiveSnapshotCells(
+  page,
+  nameBox,
+  rows,
+  layout,
+  targetRowNumber,
+  historicalStyleSource,
+  activeSnapshotIndex
+) {
+  const firstIssueIndex = rows.findIndex(
+    (row, index) =>
+      index > layout.headerIndex &&
+      index < layout.issueEndIndex &&
+      jiraKeyFromCell(row[2]) !== ""
+  );
+  const sourceCell = historicalStyleSource
+    ? `${columnName(historicalStyleSource.columnIndex)}${historicalStyleSource.rowIndex + 1}`
+    : firstIssueIndex >= 0
+      ? `A${firstIssueIndex + 1}`
+      : `A${targetRowNumber}`;
+
+  const inactiveSnapshotIndexes = layout.snapshotIndexes.filter(
+    (snapshotIndex) => snapshotIndex !== activeSnapshotIndex
+  );
+  for (const snapshotIndex of inactiveSnapshotIndexes) {
+    const targetCell = `${columnName(snapshotIndex)}${targetRowNumber}`;
+    await copyCell(page, nameBox, sourceCell, targetCell);
+    await clearRange(page, nameBox, targetCell);
+    await setCellFillColor(page, nameBox, targetCell, "진한 회색 3");
+    console.log(`[이전 SNAPSHOT 없음] ${targetCell} = 진한 회색 3`);
+  }
 }
 
 async function copyRowFormattingAndValidation(
@@ -798,13 +2034,96 @@ async function copyRowFormattingAndValidation(
   await page.waitForTimeout(400);
   await nameBox.fill(`A${targetRowNumber}`);
   await nameBox.press("Enter");
+  await assertTargetSheetMutation(page, `${targetRowNumber}행 양식 복사`);
   await page.keyboard.press("Control+V");
   await page.waitForTimeout(750);
-  await pasteTsv(
+  await clearRange(
     page,
     nameBox,
-    `A${targetRowNumber}`,
-    Array(columnCount).fill("").join("\t")
+    `A${targetRowNumber}:${lastColumn}${targetRowNumber}`
+  );
+}
+
+async function copyPreparedNewChecklistRow(
+  page,
+  nameBox,
+  sourceRowNumber,
+  targetRowNumber,
+  columnCount
+) {
+  const lastColumn = columnName(columnCount - 1);
+  await nameBox.fill(`A${sourceRowNumber}:${lastColumn}${sourceRowNumber}`);
+  await nameBox.press("Enter");
+  await page.keyboard.press("Control+C");
+  await page.waitForTimeout(300);
+  await nameBox.fill(`A${targetRowNumber}`);
+  await nameBox.press("Enter");
+  await assertTargetSheetMutation(
+    page,
+    `${targetRowNumber}행 신규 체크리스트 양식 복사`
+  );
+  await page.keyboard.press("Control+V");
+  await page.waitForTimeout(650);
+  await clearRange(
+    page,
+    nameBox,
+    `A${targetRowNumber}:I${targetRowNumber}`
+  );
+  console.log(
+    `[신규 행 빠른 복사] ${sourceRowNumber}행 → ${targetRowNumber}행`
+  );
+}
+
+async function copyTypeStyleFromTemplateSheet(
+  page,
+  nameBox,
+  request,
+  {
+    spreadsheetId,
+    templateSheetName,
+    targetSheetName,
+    targetRowNumber,
+    issueType
+  }
+) {
+  const template = await selectSheetByName(page, templateSheetName);
+  if (template.spreadsheetId !== spreadsheetId) {
+    throw new Error("유형 색상 기준 시트가 대상 스프레드시트와 일치하지 않습니다.");
+  }
+  const templateExportUrl =
+    `https://docs.google.com/spreadsheets/d/${spreadsheetId}` +
+    `/export?format=csv&gid=${template.gid}`;
+  const templateRows = await readSheetRows(request, templateExportUrl);
+  const templateLayout = inspectLayout(templateRows);
+  const sourceIndex = findMatchingTypeRowIndex(
+    templateRows,
+    templateLayout,
+    issueType
+  );
+  if (sourceIndex == null) {
+    await selectSheetByName(page, targetSheetName);
+    throw new Error(
+      `기준 시트 ${templateSheetName}에서 ` +
+        `${issueType || "(유형 없음)"} 유형의 색상 양식을 찾지 못했습니다.`
+    );
+  }
+
+  await nameBox.fill(`B${sourceIndex + 1}`);
+  await nameBox.press("Enter");
+  await page.keyboard.press("Control+C");
+  await page.waitForTimeout(300);
+  await selectSheetByName(page, targetSheetName);
+  await nameBox.fill(`B${targetRowNumber}`);
+  await nameBox.press("Enter");
+  await assertTargetSheetMutation(
+    page,
+    `B${targetRowNumber} 유형 색상 적용`
+  );
+  await page.keyboard.press("Control+V");
+  await page.waitForTimeout(300);
+  console.log(
+    `[신규 유형 색상 적용] ${issueType}: ` +
+      `${templateSheetName}!B${sourceIndex + 1} → B${targetRowNumber}`
   );
 }
 
@@ -812,13 +2131,17 @@ async function copyTemplateRowFromSheet(
   page,
   nameBox,
   request,
-  spreadsheetId,
-  templateSheetName,
-  targetSheetName,
-  targetRowNumber,
-  targetLayout,
-  issueType
+  config
 ) {
+  const {
+    spreadsheetId,
+    templateSheetName,
+    snapshotDropdownSourceCell,
+    targetSheetName,
+    targetRowNumber,
+    targetLayout,
+    issueType
+  } = validateTemplateCopyConfig(config);
   const template = await selectSheetByName(page, templateSheetName);
   if (template.spreadsheetId !== spreadsheetId) {
     throw new Error("양식 시트가 대상 스프레드시트와 일치하지 않습니다.");
@@ -861,56 +2184,60 @@ async function copyTemplateRowFromSheet(
   await selectSheetByName(page, targetSheetName);
   await nameBox.fill(`A${targetRowNumber}`);
   await nameBox.press("Enter");
+  await assertTargetSheetMutation(
+    page,
+    `${targetRowNumber}행 기준 양식 복사`
+  );
   await page.keyboard.press("Control+V");
   await page.waitForTimeout(750);
 
-  if (
-    targetLayout.snapshotIndexes.length > 0 &&
-    templateLayout.snapshotIndexes.length > 0
-  ) {
-    await selectSheetByName(page, templateSheetName);
-    const sourceSnapshotColumn = columnName(templateLayout.snapshotIndexes[0]);
-    await nameBox.fill(
-      `${sourceSnapshotColumn}${templateRowNumber}`
-    );
-    await nameBox.press("Enter");
-    await page.keyboard.press("Control+C");
-    await page.waitForTimeout(300);
-    await selectSheetByName(page, targetSheetName);
-    for (const targetIndex of targetLayout.snapshotIndexes) {
+  await clearRange(
+    page,
+    nameBox,
+    `A${targetRowNumber}:` +
+      `${columnName(targetLayout.columnCount - 1)}${targetRowNumber}`
+  );
+
+  await nameBox.fill(snapshotDropdownSourceCell);
+  await nameBox.press("Enter");
+  await page.keyboard.press("Control+C");
+  await page.waitForTimeout(300);
+
+  if (targetLayout.snapshotIndexes.length > 0) {
+    const targetSnapshotIndexes = [
+      ...new Set(
+        [
+          ...targetLayout.snapshotIndexes,
+          targetLayout.snapshotWorkIndex
+        ].filter((index) => index >= 0)
+      )
+    ];
+    for (const targetIndex of targetSnapshotIndexes) {
       await nameBox.fill(`${columnName(targetIndex)}${targetRowNumber}`);
       await nameBox.press("Enter");
+      await assertTargetSheetMutation(
+        page,
+        `${columnName(targetIndex)}${targetRowNumber} SNAPSHOT 드롭다운 복사`
+      );
       await page.keyboard.press("Control+V");
       await page.waitForTimeout(250);
     }
   }
 
-  if (
-    targetLayout.referenceIndex >= 0 &&
-    templateLayout.referenceIndex >= 0
-  ) {
-    await selectSheetByName(page, templateSheetName);
-    await nameBox.fill(
-      `${columnName(templateLayout.referenceIndex)}${templateRowNumber}`
-    );
-    await nameBox.press("Enter");
-    await page.keyboard.press("Control+C");
-    await page.waitForTimeout(300);
-    await selectSheetByName(page, targetSheetName);
+  if (targetLayout.referenceIndex >= 0) {
     await nameBox.fill(
       `${columnName(targetLayout.referenceIndex)}${targetRowNumber}`
     );
     await nameBox.press("Enter");
+    await assertTargetSheetMutation(
+      page,
+      `${columnName(targetLayout.referenceIndex)}${targetRowNumber} ` +
+        `참고사항 드롭다운 복사`
+    );
     await page.keyboard.press("Control+V");
     await page.waitForTimeout(300);
   }
 
-  await pasteTsv(
-    page,
-    nameBox,
-    `A${targetRowNumber}`,
-    Array(targetLayout.columnCount).fill("").join("\t")
-  );
 }
 
 function columnName(index) {
@@ -932,14 +2259,59 @@ async function pasteTsv(page, nameBox, targetCell, text) {
   await nameBox.fill(targetCell);
   await nameBox.press("Enter");
   await page.waitForTimeout(200);
+  await assertTargetSheetMutation(page, `${targetCell} 값 입력`);
   await page.keyboard.press("Control+V");
   await page.waitForTimeout(750);
 }
 
-async function waitForIssueRow(request, exportUrl, issue, rowNumber) {
+async function enterCellText(page, nameBox, targetCell, text) {
+  await nameBox.fill(targetCell);
+  await nameBox.press("Enter");
+  await page.waitForTimeout(250);
+  await assertTargetSheetMutation(page, `${targetCell} 텍스트 입력`);
+  await page.keyboard.press("F2");
+  await page.waitForTimeout(100);
+  await page.keyboard.press("Control+A");
+  await page.keyboard.insertText(text);
+  await page.keyboard.press("Enter");
+  await page.waitForTimeout(1_000);
+}
+
+async function selectDropdownValue(page, nameBox, targetCell, value) {
+  await nameBox.fill(targetCell);
+  await nameBox.press("Enter");
+  await page.waitForTimeout(250);
+  await assertTargetSheetMutation(
+    page,
+    `${targetCell} 드롭다운 값 ${value} 선택`
+  );
+  await page.keyboard.press("Enter");
+  try {
+    await page.keyboard.insertText(value);
+    await page.waitForTimeout(200);
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(1_000);
+    console.log(`[SNAPSHOT 드롭다운 키보드 선택] ${targetCell} = ${value}`);
+  } catch (error) {
+    await page.keyboard.press("Escape").catch(() => {});
+    throw new Error(
+      `SNAPSHOT 드롭다운에서 값을 선택하지 못했습니다: ` +
+        `${targetCell}, 선택값=${value}, 원인=${error.message}`
+    );
+  }
+}
+
+async function waitForIssueRow(
+  request,
+  exportUrl,
+  issue,
+  rowNumber,
+  snapshotExpectation = null,
+  referenceExpectation = null
+) {
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 2_000));
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 500));
     const rows = await readSheetRows(request, exportUrl);
     const row = rows[rowNumber - 1] ?? [];
     if (
@@ -947,9 +2319,16 @@ async function waitForIssueRow(request, exportUrl, issue, rowNumber) {
       row[4] === issue.title &&
       row[5] === issue.status &&
       row[6] === issue.priority &&
-      row[7] === issue.assignee
+      row[7] === issue.assignee &&
+      (!snapshotExpectation ||
+        String(row[snapshotExpectation.columnIndex] ?? "") ===
+          snapshotExpectation.value) &&
+      (!referenceExpectation ||
+        String(row[referenceExpectation.columnIndex] ?? "")
+          .trim()
+          .toUpperCase() === referenceExpectation.value)
     ) {
-      return row;
+      return { row, rows };
     }
   }
   throw new Error(`${issue.key}의 Google Sheets 저장 검증에 실패했습니다.`);
@@ -1069,6 +2448,7 @@ function normalizeCustomerName(value) {
 }
 
 async function readSheetRows(request, exportUrl) {
+  const startedAt = Date.now();
   const separator = exportUrl.includes("?") ? "&" : "?";
   const freshUrl =
     `${exportUrl}${separator}_=${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -1082,7 +2462,10 @@ async function readSheetRows(request, exportUrl) {
   if (!response.ok()) {
     throw new Error(`Google Sheets CSV 조회 실패: HTTP ${response.status()}`);
   }
-  return parseCsv(await response.text());
+  const rows = parseCsv(await response.text());
+  sheetReadCount += 1;
+  sheetReadDurationMs += Date.now() - startedAt;
+  return rows;
 }
 
 function parseCsv(text) {
