@@ -63,52 +63,78 @@
                 <span class="eyebrow">입력</span>
                 <h2>동기화 설정</h2>
               </div>
-              <button id="loginButton" class="button button-secondary" type="button">
-                Jira 로그인
-              </button>
+              <div class="login-required">
+                <span class="required-mark">필수</span>
+                <button id="loginButton" class="button button-secondary" type="button">
+                  Jira 로그인
+                </button>
+              </div>
             </div>
-
-            <label class="field">
-              <span class="field-label-row">
-                <span>Jira 서버 주소</span>
-                <span class="default-value">
-                  기본값: <code>http://jira.example.local:8079/</code>
-                  <button class="copy-default" type="button" data-copy="http://jira.example.local:8079/" data-target="jiraBaseUrl">복사</button>
-                </span>
-              </span>
-              <input
-                id="jiraBaseUrl"
-                type="url"
-                placeholder="예: http://jira.example.local:8079"
-                autocomplete="off"
-                spellcheck="false"
-              />
-            </label>
 
             <label class="field">
               <span>Jira 번호 목록</span>
               <textarea
                 id="issueKeys"
                 rows="5"
-                placeholder="MS-12847, MS-12848&#10;MS-4395"
+                placeholder="예: MS-12818, MS-12807&#10;[MS-12469] - MyPage - 결재현황 버튼 추가&#10;버그&#10;[MS-12811] - [고객사] 결재현황 개선"
                 spellcheck="false"
               ></textarea>
               <small>분류와 제목을 함께 붙여넣어도 Jira 번호만 자동 추출합니다.</small>
             </label>
 
+            <fieldset class="work-mode-fields">
+              <legend>
+                작업 유형 <span class="required-mark">필수</span>
+              </legend>
+              <div class="work-mode-grid">
+                <label class="work-mode-option">
+                  <input type="radio" name="workMode" value="new" />
+                  <span>
+                    <strong>신규 체크리스트에 최초 등록</strong>
+                    <small>복사한 시트의 기존 이슈 영역을 초기화하고 새로 등록합니다.</small>
+                  </span>
+                </label>
+                <label class="work-mode-option">
+                  <input type="radio" name="workMode" value="existing" />
+                  <span>
+                    <strong>기존 체크리스트에 추가·업데이트</strong>
+                    <small>현재 이슈와 SNAPSHOT 결과를 유지하면서 추가하거나 갱신합니다.</small>
+                  </span>
+                </label>
+              </div>
+            </fieldset>
+
+            <label class="field">
+              <span>
+                등록할 SNAPSHOT <span class="required-mark">필수</span>
+              </span>
+              <input
+                id="snapshotName"
+                type="text"
+                placeholder="예: SNAPSHOT-3"
+                autocomplete="off"
+                spellcheck="false"
+              />
+              <small>
+                시트에 같은 헤더가 있으면 해당 열을 사용하고, 없으면 새 열을 만듭니다.
+              </small>
+            </label>
+
             <label class="field">
               <span class="field-label-row">
-                <span>Google Sheets 링크</span>
+                <span>
+                  Google Sheets 링크 <span class="required-mark">필수</span>
+                </span>
                 <span class="default-value">
-                  기본값: <code>https://docs.google.com/spreadsheets/d/YOUR_SPREADSHEET_ID/edit</code>
-                  <button class="copy-default" type="button" data-copy="https://docs.google.com/spreadsheets/d/YOUR_SPREADSHEET_ID/edit" data-target="sheetUrl">복사</button>
+                  예시: <code>https://docs.google.com/spreadsheets/d/YOUR_SPREADSHEET_ID/edit?gid=94813446#gid=94813446</code>
+                  <button class="copy-default" type="button" data-copy="https://docs.google.com/spreadsheets/d/YOUR_SPREADSHEET_ID/edit?gid=94813446#gid=94813446" data-target="sheetUrl">복사</button>
                 </span>
               </span>
               <div class="inline-field">
                 <input
                   id="sheetUrl"
                   type="url"
-                  placeholder="예: https://docs.google.com/spreadsheets/d/..."
+                  placeholder="예: https://docs.google.com/spreadsheets/d/.../edit?gid=123#gid=123"
                   autocomplete="off"
                   spellcheck="false"
                 />
@@ -117,19 +143,27 @@
                 </button>
               </div>
               <small class="field-warning">
-                주의: 작업할 버전에 맞는 Google Sheets 주소를 입력하세요.
+                주의: 작업할 시트 탭을 연 상태에서 주소창의 전체 링크를 복사하세요. 링크의 gid로 탭을 자동 선택합니다.
               </small>
             </label>
 
             <label class="field">
-              <span>대상 시트 탭 이름</span>
-              <input
-                id="sheetName"
-                type="text"
-                placeholder="4.2.2.59 (LS증권)"
-                autocomplete="off"
-              />
-              <small>링크의 gid보다 탭 이름을 우선하며, 이름의 공백은 무시합니다.</small>
+              <span>결과 저장 폴더</span>
+              <div class="inline-field">
+                <input
+                  id="outputDirectory"
+                  type="text"
+                  placeholder="예: C:\Users\사용자\Desktop"
+                  autocomplete="off"
+                  spellcheck="false"
+                />
+                <button id="chooseOutputButton" class="icon-button" type="button">
+                  폴더 선택
+                </button>
+              </div>
+              <small>
+                기본값은 Windows 바탕화면입니다. 성공·실패 이력은 날짜별 작업결과 TXT에 최신 실행부터 누적됩니다.
+              </small>
             </label>
 
             <fieldset class="schedule-fields">
@@ -153,19 +187,11 @@
             <div class="security-note">
               <span aria-hidden="true">●</span>
               <p>
-                비밀번호는 저장하지 않습니다. Jira 로그인 쿠키와 실행 결과는
-                이 PC의 앱 데이터 폴더에만 보관됩니다.
+                비밀번호는 저장하지 않습니다. Jira 로그인 쿠키는 이 PC에만
+                임시 보관되며, 실행 결과는 위에서 지정한 폴더에 저장됩니다.
               </p>
             </div>
 
-            <div class="form-actions">
-              <button id="syncButton" class="button button-primary" type="button">
-                조회 및 시트 반영
-              </button>
-              <button id="cancelButton" class="button button-danger hidden" type="button">
-                작업 취소
-              </button>
-            </div>
           </section>
 
           <section class="panel activity-panel">
@@ -174,7 +200,15 @@
                 <span class="eyebrow">실행 상태</span>
                 <h2 id="activityTitle">대기 중</h2>
               </div>
-              <span id="runBadge" class="badge badge-neutral">READY</span>
+              <div class="activity-actions">
+                <button id="syncButton" class="button button-primary" type="button">
+                  작업 시작
+                </button>
+                <button id="cancelButton" class="button button-danger hidden" type="button">
+                  작업 중지
+                </button>
+                <span id="runBadge" class="badge badge-neutral">READY</span>
+              </div>
             </div>
 
             <div id="progressTrack" class="progress-track" aria-hidden="true">

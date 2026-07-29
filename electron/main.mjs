@@ -6,21 +6,21 @@ import {
   app,
   BrowserWindow,
   clipboard,
+  dialog,
   ipcMain,
   shell
 } from "electron";
+import { parseGoogleSheetLink } from "../scripts/google-sheet-url.mjs";
+import { prependDailyResult } from "../scripts/result-history.mjs";
+import {
+  normalizeSnapshotName,
+  normalizeWorkMode
+} from "../scripts/sync-mode.mjs";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
-const defaultSettings = {
-  settingsVersion: 4,
-  jiraBaseUrl: "",
-  issueKeys: "",
-  sheetUrl: "",
-  sheetName: "",
-  deadline: "",
-  testStartDate: "",
-  testEndDate: ""
-};
+const jiraBaseUrl =
+  process.env.JIRA_BASE_URL ?? "http://jira.example.local:8079";
+const settingsVersion = 8;
 
 let mainWindow;
 let activeJob = null;
@@ -99,7 +99,7 @@ function registerIpcHandlers() {
       settings,
       jiraSessionReady: await fileExists(jiraAuthPath()),
       running: Boolean(activeJob),
-      outputPath: outputPath()
+      outputPath: settings.outputDirectory
     };
   });
 
@@ -109,14 +109,9 @@ function registerIpcHandlers() {
     return settings;
   });
 
-  ipcMain.handle("jira:login", async (_event, input) => {
+  ipcMain.handle("jira:login", async () => {
     assertIdle();
-    const settings = normalizeSettings({
-      ...(await loadSettings()),
-      jiraBaseUrl: input?.jiraBaseUrl
-    });
-    settings.jiraBaseUrl = validateJiraBaseUrl(settings.jiraBaseUrl);
-    await saveSettings(settings);
+    const settings = await loadSettings();
     return startJob("jira-login", "jira-login.mjs", [], settings);
   });
 
@@ -124,8 +119,13 @@ function registerIpcHandlers() {
     assertIdle();
     const settings = normalizeSettings(input);
     const issueKeys = parseIssueKeys(settings.issueKeys);
-    settings.jiraBaseUrl = validateJiraBaseUrl(settings.jiraBaseUrl);
     validateSheetSettings(settings);
+    settings.workMode = normalizeWorkMode(settings.workMode);
+    settings.snapshotName = normalizeSnapshotName(settings.snapshotName);
+    settings.outputDirectory = validateOutputDirectory(
+      settings.outputDirectory
+    );
+    await mkdir(settings.outputDirectory, { recursive: true });
     settings.deadline = validateOptionalDate(
       settings.deadline,
       "테스트 배포일정(데드라인)"
@@ -157,8 +157,10 @@ function registerIpcHandlers() {
         issueKeys.join(","),
         "--sheet-url",
         settings.sheetUrl,
-        "--sheet-name",
-        settings.sheetName,
+        "--work-mode",
+        settings.workMode,
+        "--snapshot-name",
+        settings.snapshotName,
         ...scheduleArgs
       ],
       settings
@@ -173,9 +175,24 @@ function registerIpcHandlers() {
     return { canceled: true };
   });
 
-  ipcMain.handle("output:open", async () => {
-    await mkdir(outputPath(), { recursive: true });
-    const error = await shell.openPath(outputPath());
+  ipcMain.handle("output:choose", async (_event, currentPath) => {
+    const fallback = defaultOutputDirectory();
+    const requested = String(currentPath ?? "").trim();
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: "결과 저장 폴더 선택",
+      defaultPath: path.isAbsolute(requested) ? requested : fallback,
+      properties: ["openDirectory", "createDirectory"]
+    });
+    return {
+      canceled: result.canceled,
+      path: result.filePaths[0] ?? ""
+    };
+  });
+
+  ipcMain.handle("output:open", async (_event, requestedPath) => {
+    const target = validateOutputDirectory(requestedPath);
+    await mkdir(target, { recursive: true });
+    const error = await shell.openPath(target);
     return { ok: error === "", error };
   });
 
@@ -194,6 +211,9 @@ function registerIpcHandlers() {
 
 function startJob(type, scriptName, args, settings) {
   const scriptPath = resolveScriptPath(scriptName);
+  const jobOutputDirectory = validateOutputDirectory(
+    settings.outputDirectory
+  );
   const child = spawn(process.execPath, [scriptPath, ...args], {
     cwd: dataPath(),
     windowsHide: true,
@@ -201,13 +221,14 @@ function startJob(type, scriptName, args, settings) {
       ...process.env,
       ELECTRON_RUN_AS_NODE: "1",
       AUTOMATION_DATA_DIR: dataPath(),
-      JIRA_BASE_URL: settings.jiraBaseUrl,
+      AUTOMATION_OUTPUT_DIR: jobOutputDirectory,
+      JIRA_BASE_URL: jiraBaseUrl,
       PLAYWRIGHT_CHANNEL: "chrome",
       FORCE_COLOR: "0"
     },
     stdio: ["ignore", "pipe", "pipe"]
   });
-  activeJob = { type, child };
+  activeJob = { type, child, outputDirectory: jobOutputDirectory };
   const stdout = [];
   const stderr = [];
 
@@ -224,17 +245,19 @@ function startJob(type, scriptName, args, settings) {
     emitJobEvent({ type: "log", level: "error", text: chunk });
   });
   child.on("error", async (error) => {
-    const failureLogPath = await writeFailureLog(
+    const failureResultPath = await writeFailureResult(
       type,
       "",
-      error.stack || error.message
+      error.stack || error.message,
+      jobOutputDirectory,
+      settings
     ).catch(() => "");
     emitJobEvent({
       type: "finished",
       job: type,
       ok: false,
       message: error.message,
-      logPath: failureLogPath
+      resultPath: failureResultPath
     });
     activeJob = null;
   });
@@ -247,22 +270,28 @@ function startJob(type, scriptName, args, settings) {
     let result = null;
     if (code === 0 && type === "sync") {
       try {
-        result = JSON.parse(output);
+        result = parseLastJsonLine(output);
       } catch {
         result = null;
       }
     }
-    const failureLogPath =
+    const failureResultPath =
       code === 0
         ? ""
-        : await writeFailureLog(type, output, errorOutput).catch(() => "");
+        : await writeFailureResult(
+            type,
+            output,
+            errorOutput,
+            jobOutputDirectory,
+            settings
+          ).catch(() => "");
     emitJobEvent({
       type: "finished",
       job: type,
       ok: code === 0,
       code,
       result,
-      logPath: failureLogPath,
+      resultPath: failureResultPath,
       message:
         code === 0
           ? type === "jira-login"
@@ -275,25 +304,61 @@ function startJob(type, scriptName, args, settings) {
   return { accepted: true, job: type };
 }
 
-async function writeFailureLog(type, output, errorOutput) {
-  await mkdir(outputPath(), { recursive: true });
-  const target = path.join(
-    outputPath(),
-    `failure-${type}-${new Date().toISOString().replace(/[:.]/g, "-")}.log`
-  );
+async function writeFailureResult(
+  type,
+  output,
+  errorOutput,
+  outputDirectory = defaultOutputDirectory(),
+  settings = {}
+) {
+  const targetDirectory = validateOutputDirectory(outputDirectory);
+  await mkdir(targetDirectory, { recursive: true });
+  const reason = summarizeError(errorOutput || output);
+  const issueKeys = [
+    ...new Set(
+      String(settings.issueKeys ?? "")
+        .toUpperCase()
+        .match(/[A-Z][A-Z0-9_]*-\d+/g) ?? []
+    )
+  ];
+  const progressLines = String(output)
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(
+      (line) =>
+        /^\[(?:성능|대상 시트|SNAPSHOT)/.test(line) &&
+        !line.includes("Call log:")
+    );
   const content = [
+    "Jira → Google Sheets 작업 결과",
+    "================================",
+    "결과: 실패",
     `작업: ${type}`,
-    `실패 시각: ${new Date().toISOString()}`,
+    `실패 시각: ${formatKoreanDateTime(new Date())}`,
+    `실패 원인: ${reason}`,
+    `Jira 목록: ${issueKeys.join(", ") || "-"}`,
+    `작업 유형: ${String(settings.workMode ?? "").trim() || "-"}`,
+    `등록 SNAPSHOT: ${String(settings.snapshotName ?? "").trim() || "-"}`,
+    `시트 링크: ${String(settings.sheetUrl ?? "").trim() || "-"}`,
     "",
-    "[오류 출력]",
-    errorOutput || "(없음)",
-    "",
-    "[일반 출력]",
-    output || "(없음)",
+    "[진행 내용]",
+    ...(progressLines.length ? [...new Set(progressLines)] : ["- 기록 없음"]),
     ""
-  ].join("\n");
-  await writeFile(target, content, "utf8");
-  return target;
+  ].join("\r\n");
+  return prependDailyResult(targetDirectory, content, new Date());
+}
+
+function formatKoreanDateTime(value) {
+  return new Intl.DateTimeFormat("ko-KR", {
+    timeZone: "Asia/Seoul",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false
+  }).format(value);
 }
 
 function emitJobEvent(payload) {
@@ -316,15 +381,32 @@ function resolveScriptPath(scriptName) {
 
 function normalizeSettings(input = {}) {
   return {
-    settingsVersion: 4,
-    jiraBaseUrl: String(input.jiraBaseUrl ?? "").trim().slice(0, 2_000),
+    settingsVersion,
     issueKeys: String(input.issueKeys ?? "").slice(0, 10_000),
+    workMode: String(input.workMode ?? "").trim().toLowerCase().slice(0, 20),
+    snapshotName: String(input.snapshotName ?? "")
+      .trim()
+      .toUpperCase()
+      .slice(0, 40),
     sheetUrl: String(input.sheetUrl ?? "").slice(0, 2_000),
-    sheetName: String(input.sheetName ?? "").trim().slice(0, 200),
+    outputDirectory: String(
+      input.outputDirectory ?? defaultOutputDirectory()
+    )
+      .trim()
+      .slice(0, 2_000),
     deadline: String(input.deadline ?? "").trim().slice(0, 10),
     testStartDate: String(input.testStartDate ?? "").trim().slice(0, 10),
     testEndDate: String(input.testEndDate ?? "").trim().slice(0, 10)
   };
+}
+
+function validateOutputDirectory(value) {
+  const raw = String(value ?? "").trim().replace(/^"(.*)"$/, "$1");
+  const target = raw || defaultOutputDirectory();
+  if (!path.isAbsolute(target)) {
+    throw new Error("결과 저장 경로는 드라이브 문자를 포함한 전체 경로로 입력하세요.");
+  }
+  return path.normalize(target);
 }
 
 function validateOptionalDate(value, label) {
@@ -353,59 +435,10 @@ function validateOptionalDate(value, label) {
 
 function validateSheetSettings(settings) {
   settings.sheetUrl = validateGoogleSheetsUrl(settings.sheetUrl).toString();
-  if (!settings.sheetName) {
-    throw new Error("대상 시트 탭 이름을 입력하세요.");
-  }
 }
 
 function validateGoogleSheetsUrl(value) {
-  const candidate = extractUrlCandidate(value);
-  let parsed;
-  try {
-    parsed = new URL(candidate);
-  } catch {
-    throw new Error(
-      "Google Sheets 링크를 입력하세요. 예: https://docs.google.com/spreadsheets/d/..."
-    );
-  }
-  if (
-    parsed.protocol !== "https:" ||
-    parsed.hostname !== "docs.google.com" ||
-    !parsed.pathname.startsWith("/spreadsheets/d/")
-  ) {
-    throw new Error("올바른 Google Sheets 링크를 입력하세요.");
-  }
-  return parsed;
-}
-
-function validateJiraBaseUrl(value) {
-  return normalizeUrl(
-    extractUrlCandidate(value),
-    ["http:", "https:"],
-    "Jira 서버 주소"
-  ).replace(/\/+$/, "");
-}
-
-function normalizeUrl(value, protocols, label) {
-  let parsed;
-  try {
-    parsed = new URL(value);
-  } catch {
-    throw new Error(`${label} 형식이 올바르지 않습니다.`);
-  }
-  if (!protocols.includes(parsed.protocol)) {
-    throw new Error(`${label}는 ${protocols.join(" 또는 ")} 주소여야 합니다.`);
-  }
-  return parsed.toString();
-}
-
-function extractUrlCandidate(value) {
-  const text = String(value ?? "").trim();
-  const markdownUrl = text.match(/\((https?:\/\/[^)]+)\)/i)?.[1];
-  if (markdownUrl) {
-    return markdownUrl;
-  }
-  return text.match(/https?:\/\/[^\s\])]+/i)?.[0] ?? text;
+  return new URL(parseGoogleSheetLink(value).canonicalUrl);
 }
 
 function parseIssueKeys(value) {
@@ -431,10 +464,16 @@ function summarizeError(text) {
     (line) =>
       !/^Node\.js v\d+/i.test(line) &&
       !/^at\s+/i.test(line) &&
+      !/^file:\/\//i.test(line) &&
+      !/^throw new Error/i.test(line) &&
+      !/^\^+$/.test(line) &&
       !/^[{}\[\],]+$/.test(line) &&
       !/^(name|stack|message):/i.test(line)
   );
-  const errorLine = meaningfulLines.find((line) =>
+  const explicitErrorLine = meaningfulLines.find((line) =>
+    /^Error:\s*/i.test(line)
+  );
+  const errorLine = explicitErrorLine ?? meaningfulLines.find((line) =>
     /(error:|net::err|econn|timeout|timed out|실패|오류|권한|만료)/i.test(line)
   );
   return (errorLine ?? meaningfulLines.at(-1) ?? "작업에 실패했습니다.").replace(
@@ -443,29 +482,41 @@ function summarizeError(text) {
   );
 }
 
+function parseLastJsonLine(output) {
+  const lines = String(output)
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    try {
+      return JSON.parse(lines[index]);
+    } catch {
+      // 실행 로그 중 마지막 JSON 결과를 찾을 때까지 계속 확인합니다.
+    }
+  }
+  return null;
+}
+
 async function loadSettings() {
   try {
     const content = await readFile(settingsPath(), "utf8");
     const stored = JSON.parse(content);
-    const migrated =
-      stored.settingsVersion === 4
-        ? stored
-        : {
-            ...stored,
-            settingsVersion: 4,
-            jiraBaseUrl: "",
-            sheetUrl: ""
-          };
+    const migrated = {
+      ...stored,
+      settingsVersion,
+      outputDirectory:
+        stored.outputDirectory || defaultOutputDirectory()
+    };
     const settings = normalizeSettings({
-      ...defaultSettings,
+      ...createDefaultSettings(),
       ...migrated
     });
-    if (stored.settingsVersion !== 4) {
+    if (stored.settingsVersion !== settingsVersion) {
       await saveSettings(settings);
     }
     return settings;
   } catch {
-    return defaultSettings;
+    return createDefaultSettings();
   }
 }
 
@@ -493,8 +544,24 @@ function dataPath() {
     : app.getPath("userData");
 }
 
-function outputPath() {
-  return path.join(dataPath(), "output");
+function defaultOutputDirectory() {
+  return process.env.AUTOMATION_DEFAULT_OUTPUT_DIR
+    ? path.resolve(process.env.AUTOMATION_DEFAULT_OUTPUT_DIR)
+    : app.getPath("desktop");
+}
+
+function createDefaultSettings() {
+  return {
+    settingsVersion,
+    issueKeys: "",
+    workMode: "",
+    snapshotName: "",
+    sheetUrl: "",
+    outputDirectory: defaultOutputDirectory(),
+    deadline: "",
+    testStartDate: "",
+    testEndDate: ""
+  };
 }
 
 function jiraAuthPath() {

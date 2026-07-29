@@ -100,7 +100,7 @@ button:disabled {
 }
 
 .header-actions,
-.form-actions,
+.activity-actions,
 .inline-field {
   display: flex;
   align-items: center;
@@ -290,6 +290,79 @@ textarea::placeholder {
   padding: 12px 12px 0;
 }
 
+.work-mode-fields {
+  margin: 2px 0 17px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px;
+}
+
+.work-mode-fields legend {
+  padding: 0 6px;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.required-mark {
+  margin-left: 4px;
+  color: var(--danger);
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.login-required {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.work-mode-grid {
+  display: grid;
+  gap: 8px;
+}
+
+.work-mode-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 11px;
+  background: #fbfcfe;
+  cursor: pointer;
+}
+
+.work-mode-option:has(input:checked) {
+  border-color: rgba(49, 94, 251, 0.45);
+  background: #f4f7ff;
+  box-shadow: 0 0 0 2px rgba(49, 94, 251, 0.08);
+}
+
+.work-mode-option input {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  margin: 2px 0 0;
+  accent-color: var(--primary);
+}
+
+.work-mode-option span,
+.work-mode-option strong,
+.work-mode-option small {
+  display: block;
+}
+
+.work-mode-option strong {
+  font-size: 12px;
+}
+
+.work-mode-option small {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
 .schedule-fields legend {
   padding: 0 6px;
   font-size: 13px;
@@ -461,8 +534,13 @@ textarea:focus {
   line-height: 1.55;
 }
 
-.form-actions {
+.activity-actions {
   justify-content: flex-end;
+  flex-wrap: wrap;
+}
+
+.activity-actions .button-primary {
+  min-width: 118px;
 }
 
 .progress-track {

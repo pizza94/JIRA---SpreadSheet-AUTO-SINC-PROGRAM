@@ -1,8 +1,9 @@
 const elements = {
-  jiraBaseUrl: document.querySelector("#jiraBaseUrl"),
   issueKeys: document.querySelector("#issueKeys"),
+  workModes: [...document.querySelectorAll('input[name="workMode"]')],
+  snapshotName: document.querySelector("#snapshotName"),
   sheetUrl: document.querySelector("#sheetUrl"),
-  sheetName: document.querySelector("#sheetName"),
+  outputDirectory: document.querySelector("#outputDirectory"),
   deadline: document.querySelector("#deadline"),
   testStartDate: document.querySelector("#testStartDate"),
   testEndDate: document.querySelector("#testEndDate"),
@@ -10,6 +11,7 @@ const elements = {
   syncButton: document.querySelector("#syncButton"),
   cancelButton: document.querySelector("#cancelButton"),
   openOutputButton: document.querySelector("#openOutputButton"),
+  chooseOutputButton: document.querySelector("#chooseOutputButton"),
   openSheetButton: document.querySelector("#openSheetButton"),
   sessionBadge: document.querySelector("#sessionBadge"),
   runBadge: document.querySelector("#runBadge"),
@@ -42,7 +44,7 @@ async function initialize() {
 
 elements.loginButton.addEventListener("click", async () => {
   try {
-    await window.jiraSheetsApp.loginJira(collectSettings());
+    await window.jiraSheetsApp.loginJira();
   } catch (error) {
     showError(error);
   }
@@ -63,9 +65,29 @@ elements.cancelButton.addEventListener("click", async () => {
 });
 
 elements.openOutputButton.addEventListener("click", async () => {
-  const result = await window.jiraSheetsApp.openOutput();
-  if (!result.ok) {
-    showToast(result.error || "결과 폴더를 열지 못했습니다.");
+  try {
+    const result = await window.jiraSheetsApp.openOutput(
+      elements.outputDirectory.value.trim()
+    );
+    if (!result.ok) {
+      showToast(result.error || "결과 폴더를 열지 못했습니다.");
+    }
+  } catch (error) {
+    showError(error);
+  }
+});
+
+elements.chooseOutputButton.addEventListener("click", async () => {
+  try {
+    const result = await window.jiraSheetsApp.chooseOutputDirectory(
+      elements.outputDirectory.value.trim()
+    );
+    if (!result.canceled && result.path) {
+      elements.outputDirectory.value = result.path;
+      await window.jiraSheetsApp.saveSettings(collectSettings());
+    }
+  } catch (error) {
+    showError(error);
   }
 });
 
@@ -93,10 +115,11 @@ for (const button of document.querySelectorAll(".copy-default")) {
 }
 
 for (const input of [
-  elements.jiraBaseUrl,
   elements.issueKeys,
+  ...elements.workModes,
+  elements.snapshotName,
   elements.sheetUrl,
-  elements.sheetName,
+  elements.outputDirectory,
   elements.deadline,
   elements.testStartDate,
   elements.testEndDate
@@ -144,6 +167,10 @@ function handleJobEvent(event) {
         if (event.result.resolvedSheetUrl) {
           elements.sheetUrl.value = event.result.resolvedSheetUrl;
         }
+        if (event.result.resultPath) {
+          appendLog(`\n[성공 결과 파일] ${event.result.resultPath}\n`);
+        }
+        resetRequiredRunSettings();
       }
       showToast(event.message);
     } else {
@@ -153,8 +180,8 @@ function handleJobEvent(event) {
       setSummary("error", "작업을 완료하지 못했습니다", event.message);
       elements.logSection.open = true;
       appendLog(`\n[실패 원인] ${event.message}\n`);
-      if (event.logPath) {
-        appendLog(`[실패 로그 파일] ${event.logPath}\n`);
+      if (event.resultPath) {
+        appendLog(`[실패 결과 파일] ${event.resultPath}\n`);
       }
       showToast(event.message);
     }
@@ -163,10 +190,12 @@ function handleJobEvent(event) {
 
 function collectSettings() {
   return {
-    jiraBaseUrl: elements.jiraBaseUrl.value.trim(),
     issueKeys: elements.issueKeys.value,
+    workMode:
+      elements.workModes.find((input) => input.checked)?.value || "",
+    snapshotName: elements.snapshotName.value.trim(),
     sheetUrl: elements.sheetUrl.value.trim(),
-    sheetName: elements.sheetName.value.trim(),
+    outputDirectory: elements.outputDirectory.value.trim(),
     deadline: elements.deadline.value.trim(),
     testStartDate: elements.testStartDate.value.trim(),
     testEndDate: elements.testEndDate.value.trim()
@@ -174,10 +203,13 @@ function collectSettings() {
 }
 
 function applySettings(settings) {
-  elements.jiraBaseUrl.value = settings.jiraBaseUrl || "";
   elements.issueKeys.value = settings.issueKeys || "";
+  for (const input of elements.workModes) {
+    input.checked = false;
+  }
+  elements.snapshotName.value = "";
   elements.sheetUrl.value = settings.sheetUrl || "";
-  elements.sheetName.value = settings.sheetName || "";
+  elements.outputDirectory.value = settings.outputDirectory || "";
   elements.deadline.value = settings.deadline || "";
   elements.testStartDate.value = settings.testStartDate || "";
   elements.testEndDate.value = settings.testEndDate || "";
@@ -199,6 +231,20 @@ function setRunningState(value) {
   elements.syncButton.disabled = running;
   elements.loginButton.disabled = running;
   elements.openSheetButton.disabled = running;
+  elements.chooseOutputButton.disabled = running;
+  elements.outputDirectory.disabled = running;
+  elements.snapshotName.disabled = running;
+  for (const input of elements.workModes) {
+    input.disabled = running;
+  }
+}
+
+function resetRequiredRunSettings() {
+  for (const input of elements.workModes) {
+    input.checked = false;
+  }
+  elements.snapshotName.value = "";
+  void window.jiraSheetsApp.saveSettings(collectSettings()).catch(() => {});
 }
 
 function setSummary(kind, title, description) {

@@ -2,12 +2,10 @@ import { mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { chromium } from "playwright";
 
-const jiraBaseUrl =
-  process.env.JIRA_BASE_URL ?? "http://jira.example.local:8079";
-const issueKey = process.env.JIRA_ISSUE_KEY ?? "MS-12847";
+const jiraBaseUrl = process.env.JIRA_BASE_URL ?? "http://jira.example.local:8079";
 const dataRoot = resolve(process.env.AUTOMATION_DATA_DIR ?? ".");
 const authFile = resolve(dataRoot, "playwright/.auth/jira.json");
-const issueUrl = `${jiraBaseUrl}/browse/${encodeURIComponent(issueKey)}`;
+const loginUrl = `${jiraBaseUrl}/secure/Dashboard.jspa`;
 const authCheckUrl = `${jiraBaseUrl}/rest/api/2/myself`;
 
 await mkdir(dirname(authFile), { recursive: true });
@@ -21,10 +19,10 @@ const browser = await chromium.launch({
 const context = await browser.newContext();
 const page = await context.newPage();
 
-console.log(`Jira 로그인 창을 엽니다: ${issueUrl}`);
+console.log(`Jira 로그인 창을 엽니다: ${loginUrl}`);
 console.log("브라우저에서 직접 로그인하세요. 비밀번호는 스크립트가 읽거나 저장하지 않습니다.");
 
-await page.goto(issueUrl, { waitUntil: "domcontentloaded" });
+await page.goto(loginUrl, { waitUntil: "domcontentloaded" });
 
 const deadline = Date.now() + 10 * 60 * 1000;
 let authenticated = false;
