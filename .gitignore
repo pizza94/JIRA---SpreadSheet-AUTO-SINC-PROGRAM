@@ -1,0 +1,6 @@
+node_modules/
+playwright/.auth/
+output/
+dist/
+dist-*/
+release-*/
