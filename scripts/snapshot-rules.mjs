@@ -34,7 +34,8 @@ const JIRA_DEVELOPMENT_IN_PROGRESS_STATUSES = new Set([
   "작업진행중",
   "개발진행중",
   "개발예정",
-  "재개발요청"
+  "재개발요청",
+  "00.backlog"
 ]);
 
 const JIRA_STATUS_SNAPSHOT_VALUES = new Map([

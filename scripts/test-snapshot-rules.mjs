@@ -100,6 +100,7 @@ assert.equal(snapshotValueForRun("테스트중", true, "작업 진행중"), "개
 assert.equal(snapshotValueForRun("개발중", true, "개발 진행중"), "개발중");
 assert.equal(snapshotValueForRun("재개발", true, "개발 예정"), "개발중");
 assert.equal(snapshotValueForRun("재개발요청", true, "재 개발 요청"), "개발중");
+assert.equal(snapshotValueForRun("추가이슈", true, "00.Backlog"), "개발중");
 assert.equal(snapshotValueForRun("테스트중", true, "보류"), "보류");
 assert.equal(snapshotValueForRun("개발중", true, "반려"), "반려");
 assert.equal(snapshotValueForRun("추가이슈", true, "개발 완료"), "");
