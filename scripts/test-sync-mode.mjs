@@ -3,6 +3,7 @@ import {
   assertSheetMutationTarget,
   countIssueRows,
   findDashboardDropdownSampleCell,
+  findNewChecklistTemplateSheet,
   findTemplateTypeStyleSource,
   findSnapshotDropdownSource,
   findPreviousSnapshotIndex,
@@ -35,6 +36,24 @@ assert.equal(
 assert.equal(
   shouldUseTemplateForInsertedRow(WORK_MODE_EXISTING, 25),
   false
+);
+assert.deepEqual(
+  findNewChecklistTemplateSheet(
+    ["4.2.2.59 (LS증권)", "스프레드시트양식", "3.8.2.13( 미래에셋증권)"],
+    "3.8.2.13( 미래에셋증권)"
+  ),
+  { sheetName: "스프레드시트양식", source: "standard-template" }
+);
+assert.deepEqual(
+  findNewChecklistTemplateSheet(
+    ["3.8.2.13( 미래에셋증권)", "4.2.0.13 (KB증권)", "4.2.2.59 (LS증권)"],
+    "3.8.2.13( 미래에셋증권)"
+  ),
+  { sheetName: "4.2.2.59 (LS증권)", source: "latest-product-version" }
+);
+assert.equal(
+  findNewChecklistTemplateSheet(["3.8.2.13( 미래에셋증권)"], "3.8.2.13( 미래에셋증권)"),
+  null
 );
 assert.equal(
   findDashboardDropdownSampleCell(

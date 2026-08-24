@@ -18,6 +18,7 @@ import {
   assertSheetMutationTarget,
   countIssueRows,
   findDashboardDropdownSampleCell,
+  findNewChecklistTemplateSheet,
   findTemplateTypeStyleSource,
   findPreviousSnapshotIndex,
   normalizeIssueTypeForStyle,
@@ -53,10 +54,7 @@ const googleAuthFile = resolve(dataRoot, "playwright/.auth/google.json");
 const args = parseArgs(process.argv.slice(2));
 const sheetMutationTargets = new WeakMap();
 const jiraFetchConcurrency = 4;
-const defaultTemplateSheetName = "4.2.2.59 (LS증권)";
-const newModeProtectedTemplateSheetNames = new Set([
-  defaultTemplateSheetName
-]);
+const defaultTemplateSheetName = "스프레드시트양식";
 const processStartedAt = Date.now();
 let sheetReadCount = 0;
 let sheetReadDurationMs = 0;
@@ -322,9 +320,14 @@ async function syncIssuesToSheet(browserInstance, issues, config) {
       gid: resolved.gid,
       sheetName: resolved.sheetName
     });
+    const templateSheet =
+      config.workMode === WORK_MODE_NEW
+        ? await resolveNewChecklistTemplateSheet(page, resolved.sheetName)
+        : null;
     if (
       config.workMode === WORK_MODE_NEW &&
-      newModeProtectedTemplateSheetNames.has(resolved.sheetName)
+      normalizeSheetName(templateSheet.sheetName) ===
+        normalizeSheetName(resolved.sheetName)
     ) {
       throw new Error(
         `${resolved.sheetName} 탭은 신규 행 양식 기준 탭이므로 초기화할 수 없습니다.`
@@ -475,7 +478,7 @@ async function syncIssuesToSheet(browserInstance, issues, config) {
                 context.request,
                 {
                   spreadsheetId: resolved.spreadsheetId,
-                  templateSheetName: defaultTemplateSheetName,
+                  templateSheetName: templateSheet.sheetName,
                   snapshotDropdownSourceCell:
                     snapshotDropdownSourceCell,
                   targetSheetName: resolved.sheetName,
@@ -540,7 +543,7 @@ async function syncIssuesToSheet(browserInstance, issues, config) {
                 context.request,
                 {
                   spreadsheetId: resolved.spreadsheetId,
-                  templateSheetName: defaultTemplateSheetName,
+                  templateSheetName: templateSheet.sheetName,
                   snapshotDropdownSourceCell:
                     snapshotDropdownSourceCell,
                   targetSheetName: resolved.sheetName,
@@ -584,7 +587,7 @@ async function syncIssuesToSheet(browserInstance, issues, config) {
           context.request,
           {
             spreadsheetId: resolved.spreadsheetId,
-            templateSheetName: defaultTemplateSheetName,
+            templateSheetName: templateSheet.sheetName,
             targetSheetName: resolved.sheetName,
             targetRowNumber: targetIndex + 1,
             issueType: issue.issueType
@@ -924,6 +927,36 @@ async function selectSheetByName(page, sheetName) {
     gid: match[2],
     url
   };
+}
+
+async function resolveNewChecklistTemplateSheet(page, targetSheetName) {
+  const tabs = page.locator(".docs-sheet-tab");
+  const count = await tabs.count();
+  const sheetNames = [];
+  for (let index = 0; index < count; index += 1) {
+    const sheetName = (await tabs.nth(index).innerText()).trim();
+    if (sheetName) {
+      sheetNames.push(sheetName);
+    }
+  }
+  const template = findNewChecklistTemplateSheet(
+    sheetNames,
+    targetSheetName,
+    defaultTemplateSheetName
+  );
+  if (template == null) {
+    throw new Error(
+      `신규 체크리스트 기준 탭을 찾지 못했습니다. ` +
+        `'${defaultTemplateSheetName}' 탭이 없고, 대상 탭 외에 제품 버전 형식의 시트도 없습니다.`
+    );
+  }
+  console.log(
+    template.source === "standard-template"
+      ? `[신규 양식 기준] ${template.sheetName} 탭 사용`
+      : `[신규 양식 기준 대체] ${defaultTemplateSheetName} 탭 없음 → ` +
+          `${template.sheetName} 탭 사용`
+  );
+  return template;
 }
 
 async function assertTargetSheetMutation(page, operation) {

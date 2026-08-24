@@ -32,6 +32,60 @@ export function shouldUseTemplateForInsertedRow(workMode, lastIssueIndex) {
   return workMode === WORK_MODE_NEW || lastIssueIndex == null;
 }
 
+function normalizedSheetName(value) {
+  return String(value ?? "").replace(/\s+/g, "").toLowerCase();
+}
+
+function productVersionFromSheetName(value) {
+  const match = String(value ?? "").match(/(\d+)\.(\d+)\.(\d+)(?:\.(\d+))?/);
+  return match ? match.slice(1).map((part) => Number(part ?? 0)) : null;
+}
+
+function compareProductVersions(left, right) {
+  const length = Math.max(left.length, right.length);
+  for (let index = 0; index < length; index += 1) {
+    const difference = (left[index] ?? 0) - (right[index] ?? 0);
+    if (difference !== 0) {
+      return difference;
+    }
+  }
+  return 0;
+}
+
+export function findNewChecklistTemplateSheet(
+  sheetNames,
+  targetSheetName,
+  preferredSheetName = "스프레드시트양식"
+) {
+  const names = (sheetNames ?? []).map((name) => String(name ?? "").trim());
+  const preferred = names.find(
+    (name) => normalizedSheetName(name) === normalizedSheetName(preferredSheetName)
+  );
+  if (preferred) {
+    return { sheetName: preferred, source: "standard-template" };
+  }
+
+  const target = normalizedSheetName(targetSheetName);
+  const candidates = names
+    .map((sheetName, index) => ({
+      sheetName,
+      index,
+      version: productVersionFromSheetName(sheetName)
+    }))
+    .filter(
+      ({ sheetName, version }) =>
+        normalizedSheetName(sheetName) !== target && version !== null
+    )
+    .sort(
+      (left, right) =>
+        compareProductVersions(right.version, left.version) || right.index - left.index
+    );
+
+  return candidates.length > 0
+    ? { sheetName: candidates[0].sheetName, source: "latest-product-version" }
+    : null;
+}
+
 export function findDashboardDropdownSampleCell(rows, columnName) {
   const matches = [];
   for (let rowIndex = 0; rowIndex < (rows ?? []).length; rowIndex += 1) {
