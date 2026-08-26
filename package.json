@@ -1,6 +1,6 @@
 {
   "name": "jira-spreadsheet-automation",
-  "version": "2.0.6",
+  "version": "2.0.7",
   "private": true,
   "description": "사내 Jira 이슈를 Google Sheets 릴리스 체크리스트에 동기화하는 Windows 데스크톱 앱",
   "main": "electron/main.mjs",

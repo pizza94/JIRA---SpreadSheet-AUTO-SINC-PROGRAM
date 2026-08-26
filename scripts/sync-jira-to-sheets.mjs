@@ -338,7 +338,7 @@ async function syncIssuesToSheet(browserInstance, issues, config) {
       `/export?format=csv&gid=${resolved.gid}`;
     const nameBox = page.locator("#t-name-box");
     await nameBox.waitFor({ state: "visible", timeout: 20_000 });
-    const results = [];
+    const resultsByKey = new Map();
     let initialRows = await readSheetRows(context.request, exportUrl);
     let initialLayout = inspectLayout(initialRows);
     findDashboardDropdownSampleCell(initialRows, columnName);
@@ -402,15 +402,15 @@ async function syncIssuesToSheet(browserInstance, issues, config) {
         : config
     );
     let currentRows = initialRows;
-    // 기존 이슈만 갱신하는 경우에는 행별 CSV 재조회 대신 마지막에 한 번에 검증한다.
-    // 신규 행이 섞이면 행 번호/서식 이동을 즉시 확인해야 하므로 기존의 건별 검증을 유지한다.
-    const deferExistingVerification = issues.every(
-      (issue) =>
-        findIssueMatches(initialRows, issue.key, initialLayout).length === 1
-    );
-    const pendingVerifications = [];
+    // 기존 행은 입력과 CSV 검증을 일괄 처리한다. 신규 행만 즉시 검증해야 행 삽입과
+    // 서식 처리의 위치가 안전하게 유지된다.
+    const pendingExistingUpdates = [];
+    const pendingExistingVerifications = [];
+    let insertedProcessingMs = 0;
+    let existingVerificationDurationMs = 0;
 
     for (const issue of issues) {
+      const issueProcessingStartedAt = Date.now();
       let rows = currentRows;
       const layout = withSnapshotWorkIndex(
         inspectLayout(rows),
@@ -618,8 +618,11 @@ async function syncIssuesToSheet(browserInstance, issues, config) {
       if (action === "updated") {
         // 기존 행의 Jira 셀은 이미 사용자가 확인한 하이퍼링크를 보존한다.
         // 이슈 번호가 일치하는 경우 JIRA 열(C)을 다시 입력하거나 수식으로 덮어쓰지 않는다.
-        await pasteTsv(page, nameBox, `A${rowNumber}`, values.slice(0, 2).join("\t"));
-        await pasteTsv(page, nameBox, `D${rowNumber}`, values.slice(3).join("\t"));
+        pendingExistingUpdates.push({
+          rowNumber,
+          basicValues: values.slice(0, 2),
+          detailValues: values.slice(3)
+        });
       } else {
         await pasteTsv(page, nameBox, `A${rowNumber}`, values.join("\t"));
       }
@@ -765,8 +768,8 @@ async function syncIssuesToSheet(browserInstance, issues, config) {
             : null,
         snapshotReset: resetSnapshot
       };
-      if (deferExistingVerification) {
-        pendingVerifications.push(verification);
+      if (action === "updated") {
+        pendingExistingVerifications.push(verification);
       } else {
         const verified = await waitForIssueRow(
           context.request,
@@ -777,33 +780,68 @@ async function syncIssuesToSheet(browserInstance, issues, config) {
           verification.referenceExpectation
         );
         currentRows = verified.rows;
-        results.push(resultFromVerifiedRow(verification, verified.row));
+        resultsByKey.set(
+          issue.key,
+          resultFromVerifiedRow(verification, verified.row)
+        );
+        insertedProcessingMs += Date.now() - issueProcessingStartedAt;
       }
     }
 
-    if (pendingVerifications.length > 0) {
+    const existingUpdateStartedAt = Date.now();
+    if (pendingExistingUpdates.length > 0) {
+      await pasteExistingIssueUpdates(
+        page,
+        nameBox,
+        pendingExistingUpdates
+      );
+    }
+    const existingWriteDurationMs = Date.now() - existingUpdateStartedAt;
+    if (pendingExistingVerifications.length > 0) {
       console.log(
-        `[성능] 기존 이슈 ${pendingVerifications.length}건 저장 결과를 일괄 검증합니다.`
+        `[성능] 기존 이슈 ${pendingExistingVerifications.length}건을 ` +
+          `연속 행 범위 단위로 입력했습니다: ${existingWriteDurationMs}ms`
+      );
+      const existingVerificationStartedAt = Date.now();
+      console.log(
+        `[성능] 기존 이슈 ${pendingExistingVerifications.length}건 저장 결과를 일괄 검증합니다.`
       );
       const verifiedRows = await waitForIssueRows(
         context.request,
         exportUrl,
-        pendingVerifications
+        pendingExistingVerifications
       );
-      results.push(
-        ...pendingVerifications.map((verification) =>
+      for (const verification of pendingExistingVerifications) {
+        resultsByKey.set(
+          verification.issue.key,
           resultFromVerifiedRow(
             verification,
             verifiedRows[verification.rowNumber - 1] ?? []
           )
-        )
+        );
+      }
+      console.log(
+        `[성능] 기존 이슈 일괄 저장 검증 완료: ` +
+          `${Date.now() - existingVerificationStartedAt}ms`
       );
+      existingVerificationDurationMs =
+        Date.now() - existingVerificationStartedAt;
     }
+
+    if (insertedProcessingMs > 0) {
+      console.log(`[성능] 신규 이슈 순차 처리: ${insertedProcessingMs}ms`);
+    }
+    const results = issues
+      .map((issue) => resultsByKey.get(issue.key))
+      .filter(Boolean);
 
     const performance = {
       totalDurationMs: Date.now() - processStartedAt,
       sheetReadCount,
-      sheetReadDurationMs
+      sheetReadDurationMs,
+      existingWriteDurationMs,
+      existingVerificationDurationMs,
+      insertedProcessingMs
     };
     console.log(
       `[성능] Google Sheets CSV 조회 ${sheetReadCount}회, ` +
@@ -2387,6 +2425,44 @@ async function pasteTsv(page, nameBox, targetCell, text) {
   await assertTargetSheetMutation(page, `${targetCell} 값 입력`);
   await page.keyboard.press("Control+V");
   await page.waitForTimeout(750);
+}
+
+async function pasteExistingIssueUpdates(page, nameBox, updates) {
+  const sorted = [...updates].sort(
+    (left, right) => left.rowNumber - right.rowNumber
+  );
+  const groups = [];
+  for (const update of sorted) {
+    const previous = groups.at(-1);
+    if (
+      previous &&
+      update.rowNumber === previous.items.at(-1).rowNumber + 1
+    ) {
+      previous.items.push(update);
+    } else {
+      groups.push({ items: [update] });
+    }
+  }
+
+  for (const { items } of groups) {
+    const firstRowNumber = items[0].rowNumber;
+    await pasteTsv(
+      page,
+      nameBox,
+      `A${firstRowNumber}`,
+      items.map((item) => item.basicValues.join("\t")).join("\n")
+    );
+    await pasteTsv(
+      page,
+      nameBox,
+      `D${firstRowNumber}`,
+      items.map((item) => item.detailValues.join("\t")).join("\n")
+    );
+  }
+  console.log(
+    `[성능] 기존 이슈 ${updates.length}건 기본 정보 입력: ` +
+      `${groups.length}개 연속 행 범위, ${groups.length * 2}회 붙여넣기`
+  );
 }
 
 async function enterCellText(page, nameBox, targetCell, text) {

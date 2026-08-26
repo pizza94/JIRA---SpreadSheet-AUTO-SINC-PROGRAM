@@ -31,6 +31,28 @@ export function buildSyncSummary({
     "[이슈별 결과]"
   ];
 
+  if (performance?.existingWriteDurationMs > 0) {
+    lines.push(
+      `기존 이슈 일괄 입력: ${formatDuration(performance.existingWriteDurationMs)}`
+    );
+  }
+  if (performance?.existingVerificationDurationMs > 0) {
+    lines.push(
+      `기존 이슈 일괄 검증: ${formatDuration(performance.existingVerificationDurationMs)}`
+    );
+  }
+  if (performance?.insertedProcessingMs > 0) {
+    lines.push(
+      `신규 이슈 순차 처리: ${formatDuration(performance.insertedProcessingMs)}`
+    );
+  }
+  if (performance?.sheetReadCount != null) {
+    lines.push(
+      `Google Sheets CSV 조회: ${performance.sheetReadCount}회 / ` +
+        `${formatDuration(performance.sheetReadDurationMs)}`
+    );
+  }
+
   if (results.length === 0) {
     lines.push("- 처리된 이슈가 없습니다.");
   } else {

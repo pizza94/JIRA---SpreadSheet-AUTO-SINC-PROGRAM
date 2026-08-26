@@ -16,7 +16,14 @@ const summary = buildSyncSummary({
     testStartDate: "",
     testEndDate: ""
   },
-  performance: { totalDurationMs: 12_345 },
+  performance: {
+    totalDurationMs: 12_345,
+    existingWriteDurationMs: 1_200,
+    existingVerificationDurationMs: 700,
+    insertedProcessingMs: 2_500,
+    sheetReadCount: 3,
+    sheetReadDurationMs: 345
+  },
   results: [
     {
       key: "MS-12756",
@@ -40,6 +47,10 @@ assert.match(summary, /MS-12756: 업데이트, 25행/);
 assert.match(summary, /MS-12847: 추가, 26행/);
 assert.match(summary, /배포 2026\.07\.30/);
 assert.match(summary, /12\.3초/);
+assert.match(summary, /기존 이슈 일괄 입력: 1\.2초/);
+assert.match(summary, /기존 이슈 일괄 검증: 700ms/);
+assert.match(summary, /신규 이슈 순차 처리: 2\.5초/);
+assert.match(summary, /Google Sheets CSV 조회: 3회 \/ 345ms/);
 assert.match(summary, /Jira-Sheets-작업결과-2026-07-28\.txt/);
 
 console.log("sync summary tests passed");
